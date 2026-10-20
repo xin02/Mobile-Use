@@ -1,0 +1,128 @@
+#!/system/bin/sh
+# Agent Mobile Use - Lightweight CLI gateway wrapper
+BASE_URL="http://127.0.0.1:3070"
+
+# Minimal JSON string escaper: backslash, double-quote, newline, CR, tab.
+# Historical note: an earlier version interpolated raw "$2/$3" into the curl
+# -d template, which broke on quotes/backslashes and silently dropped multi-word
+# args; do not re-inline raw parameters into JSON without escaping first.
+json_escape() {
+    printf '%s' "$1" | awk '
+    BEGIN { ORS = "" }
+    {
+        if (NR > 1) printf "\\n"
+        gsub(/\\/, "\\\\")
+        gsub(/"/, "\\\"")
+        gsub(/\r/, "\\r")
+        gsub(/\t/, "\\t")
+        printf "%s", $0
+    }'
+}
+SERVER_BIN="/data/adb/modules/agent_mobile_use/bin/vd_server"
+if [ ! -x "$SERVER_BIN" ]; then
+    SERVER_BIN="$(cd "$(dirname "$0")/../.." && pwd)/bin/vd_server"
+fi
+
+ensure_server() {
+    if ! curl -s --max-time 1 "$BASE_URL/api/status" >/dev/null 2>&1; then
+        if [ -x "$SERVER_BIN" ]; then
+            nohup "$SERVER_BIN" > /data/local/tmp/vd_server.log 2>&1 &
+            for i in $(seq 1 20); do
+                sleep 0.1
+                curl -s --max-time 1 "$BASE_URL/api/status" >/dev/null 2>&1 && break
+            done
+        fi
+    fi
+}
+
+case "$1" in
+    start)
+        ensure_server
+        curl -s -X POST "$BASE_URL/api/start"
+        echo ""
+        ;;
+    stop)
+        curl -s -X POST "$BASE_URL/api/stop"
+        echo ""
+        ;;
+    restart)
+        curl -s -X POST "$BASE_URL/api/stop" >/dev/null 2>&1
+        sleep 0.5
+        ensure_server
+        curl -s -X POST "$BASE_URL/api/start"
+        echo ""
+        ;;
+    status)
+        curl -s "$BASE_URL/api/status"
+        echo ""
+        ;;
+    mode)
+        ensure_server
+        curl -s -X POST "$BASE_URL/api/mode?mode=$2"
+        echo ""
+        ;;
+    launch)
+        ensure_server
+        shift
+        pkg=$(json_escape "$*")
+        curl -s -X POST "$BASE_URL/api/action" -H "Content-Type: application/json" -d "{\"action\": \"launch_app\", \"package\": \"$pkg\"}"
+        echo ""
+        ;;
+    tree|dump)
+        ensure_server
+        curl -s "$BASE_URL/api/dump_ui?raw=1"
+        ;;
+    tap)
+        ensure_server
+        curl -s -X POST "$BASE_URL/api/action" -H "Content-Type: application/json" -d "{\"action\": \"click\", \"coordinate\": [$2, $3]}"
+        echo ""
+        ;;
+    swipe)
+        ensure_server
+        curl -s -X POST "$BASE_URL/api/action" -H "Content-Type: application/json" -d "{\"action\": \"swipe\", \"coordinate\": [$2, $3], \"end_coordinate\": [$4, $5], \"duration_ms\": ${6:-300}}"
+        echo ""
+        ;;
+    set_value)
+        ensure_server
+        if [ "$#" -ge 3 ]; then
+            target=$(json_escape "$2")
+            shift 2
+            text=$(json_escape "$*")
+            curl -s -X POST "$BASE_URL/api/action" -H "Content-Type: application/json" -d "{\"action\": \"set_value\", \"target\": \"$target\", \"text\": \"$text\"}"
+        else
+            text=$(json_escape "$2")
+            curl -s -X POST "$BASE_URL/api/action" -H "Content-Type: application/json" -d "{\"action\": \"set_value\", \"text\": \"$text\"}"
+        fi
+        echo ""
+        ;;
+    key)
+        ensure_server
+        key=$(json_escape "$2")
+        curl -s -X POST "$BASE_URL/api/action" -H "Content-Type: application/json" -d "{\"action\": \"key\", \"key\": \"$key\"}"
+        echo ""
+        ;;
+    screenshot)
+        ensure_server
+        out="${2:-/data/local/tmp/vd_screenshot.jpg}"
+        if curl -s -f "$BASE_URL/api/screenshot" -o "$out"; then
+            echo "[vd] 快照已保存至: $out"
+        else
+            echo "[vd] 截图失败"
+            exit 1
+        fi
+        ;;
+    apps|list_apps)
+        ensure_server
+        curl -s "$BASE_URL/api/apps?raw=1&query=$2"
+        ;;
+    *)
+        echo "Agent Mobile Use - 虚拟副屏控制 CLI"
+        echo ""
+        echo "用法: vd <command> [args...]"
+        echo "  start | stop | restart | status | mode <fg|bg|idle>"
+        echo "  launch <pkg> [--user <id>]"
+        echo "  tree | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [ms]"
+        echo "  set_value [target] <text> | key <keycode>"
+        echo "  screenshot [path] | apps [query]"
+        ;;
+esac

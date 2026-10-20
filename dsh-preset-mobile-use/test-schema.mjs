@@ -1,0 +1,65 @@
+import assert from "node:assert";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const pluginPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "preset/mobile-use/mobile_plugin.js");
+const mod = await import(pathToFileURL(pluginPath).href);
+
+let registeredTool = null;
+const ctx = {
+	tools: { register: (t) => { registeredTool = t; } },
+	on: () => {},
+	get: () => undefined,
+};
+
+await mod.apply(ctx);
+
+assert(registeredTool, "tool should be registered");
+assert.strictEqual(registeredTool.name, "mobile");
+
+const schema = registeredTool.parameters;
+assert(schema, "parameters must exist");
+assert.strictEqual(schema.type, "object");
+assert.deepStrictEqual(schema.required, ["action"]);
+
+const props = schema.properties;
+
+// 1. Verify action
+assert.deepStrictEqual(props.action.enum, [
+	"observe",
+	"click",
+	"swipe",
+	"set_value",
+	"key",
+	"wait",
+	"launch_app",
+	"list_apps",
+	"switch_mode",
+]);
+assert(!props.action.enum.includes("type"), "type must not be in action enum");
+assert(!props.action.enum.includes("status"), "status must not be in action enum");
+for (const act of props.action.enum) {
+	assert(props.action.description.includes(`'${act}'`), `action.description must include '${act}'`);
+}
+
+// 2. Verify coordinate fields
+assert.strictEqual(props.coordinate.type, "array");
+assert.strictEqual(props.end_coordinate.type, "array");
+assert.strictEqual(props.x, undefined, "x should be removed");
+assert.strictEqual(props.y, undefined, "y should be removed");
+assert.strictEqual(props.x2, undefined, "x2 should be removed");
+assert.strictEqual(props.y2, undefined, "y2 should be removed");
+assert.strictEqual(props.activity, undefined, "activity should be removed");
+
+// 3. Verify mode & screenshot
+assert.deepStrictEqual(props.mode.enum, ["foreground", "background", "idle"]);
+assert.strictEqual(props.screenshot.type, "boolean");
+assert.strictEqual(props.target_mode, undefined, "target_mode should be replaced by mode");
+
+// 4. Verify parameter count: action, coordinate, end_coordinate, target, text, duration_ms, mode, screenshot = 8
+assert.strictEqual(Object.keys(props).length, 8);
+
+// 5. Verify mobile description
+assert(registeredTool.description.includes("Auto-switches to 'idle' on session end"), "mobile.description should include auto-switch idle");
+
+console.log("All parameter schema assertions passed!");

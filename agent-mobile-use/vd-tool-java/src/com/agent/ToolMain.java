@@ -1,0 +1,2359 @@
+package com.agent;
+
+import android.accessibilityservice.AccessibilityServiceInfo;
+import android.graphics.Rect;
+import android.os.HandlerThread;
+import android.os.Looper;
+import android.os.SystemClock;
+import android.view.accessibility.AccessibilityNodeInfo;
+
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Host-side UI tool for agent-mobile-use.
+ *
+ * Commands:
+ *   tree|dump <displayId> [budget] [--no-system-ui]  Flat accessibility observation dump
+ *   type <displayId> [targetSpec] <text>             Silent dual-track text injection
+ *   apps|list_apps [query]                           List launchable apps and activities
+ *
+ * NOTE ON THE MAIN LOOPER (do not remove):
+ * app_process starts a process with no main Looper. UiAutomation.connect() reaches
+ * AccessibilityInteractionClient, whose constructor runs new Handler(Looper.getMainLooper());
+ * on a background thread with no main Looper that throws, and RuntimeInit then kills the
+ * whole process (observed as exit 137 / "Killed", with an uncaught-exception stack in logcat).
+ * Preparing the main looper up front is what keeps this tool alive.
+ */
+public class ToolMain {
+
+    /** Fields kept per node. The wire format is written by hand in renderNode(). */
+    public static class NodeItem {
+        public int id;
+        public AccessibilityNodeInfo rawNode;
+        public int depth;
+        public String type;
+        public String text;
+        public String desc;
+        public String hint;
+        public String tooltip;
+        public String viewId;
+        public int left, top, right, bottom;
+        public int centerX, centerY;
+
+        // ---- raw signals ----
+        public boolean clickable;   // isClickable(): the only click signal worth emitting
+                                    // (measured identical to ACTION_CLICK across 115 nodes / 3 apps)
+        public boolean editableFlag;
+        public boolean enabled;
+        public boolean visibleToUser;
+        public boolean focusable;
+        public boolean focused;
+        public boolean checkable;
+        public boolean checked;
+        public boolean selected;
+        public boolean scrollable;
+        public boolean folded;
+
+        // ---- resolved click target ----
+        public int targetId = -1;      // self if clickable, else nearest clickable ancestor
+        public int targetCenterX, targetCenterY;
+        public int targetRatio = 1;    // ancestor area / self area; 1 when target is self
+        public String tapReason;       // set when an inherited target was suppressed
+
+        // ---- budget ranking (filled by rankForBudget) ----
+        public int priority;
+
+        /**
+         * Whether this node does something the model cares about: navigate, open a
+         * submenu, show a destination. A pure checkbox or a decorative toggle ranks below
+         * a control that changes where you are, which is the difference that cost Amap
+         * its 查路线 button when the budget ran out inside one priority tier.
+         */
+        public boolean actionBearing;
+
+        // ---- window provenance ----
+        /**
+         * Index of the window this node came from, in the z-order returned by
+         * getWindowsOnAllDisplays (0 = bottom-most).
+         *
+         * All windows used to be flattened into one list, which meant a modal dialog's
+         * nodes sat interleaved with the activity underneath it and the model had no way
+         * to tell that the lower ones were covered. Taobao's 闪购外卖红包 poplayer is
+         * exactly this case.
+         */
+        public int windowIndex;
+    }
+
+    /** A clickable node offered as an ancestor target to non-clickable children. */
+    static class Candidate {
+        int id;
+        int left, top, right, bottom;
+        int centerX, centerY;
+        int area;
+
+        static Candidate of(NodeItem n) {
+            Candidate c = new Candidate();
+            c.id = n.id;
+            c.left = n.left; c.top = n.top; c.right = n.right; c.bottom = n.bottom;
+            c.centerX = n.centerX; c.centerY = n.centerY;
+            c.area = Math.max(1, (n.right - n.left) * (n.bottom - n.top));
+            return c;
+        }
+    }
+
+    /**
+     * Hard caps. The DSH tool-result pruner replaces the middle of any result over
+     * thresholdChars with a fixed marker, keeping only headChars + tailChars — so an
+     * over-budget dump reaches the model as a corrupt, silently incomplete node list.
+     * The budget below must therefore stay under the preset's thresholdChars (raised to
+     * 23000 alongside this change) with room for the envelope and the fields the Go
+     * server adds.
+     *
+     * Sized so that a dense screen arrives WHOLE in one call, because there is no paging
+     * to fall back on any more. Measured worst case over five dense apps: Amap 10403
+     * chars / 120 nodes, Taobao 11010 / 125, WeChat 7319 / 67, Meituan 4241 / 45,
+     * Settings 3920 / 34. 20000 therefore leaves roughly 2x headroom over everything
+     * measured, while still staying clear of the pruner's line.
+     *
+     * MAX_NODES is deliberately far above what the char budget can ever admit (a node
+     * costs roughly 100 chars, so 20000 is about 200 nodes). Keeping it that high means
+     * the char budget is the ONLY thing that can truncate a dump, so there is one place
+     * to reason about rather than two.
+     *
+     * `ctr` used to be ~15% of this payload for zero information, which is what made
+     * 6800 too small for a dense screen.
+     */
+    private static final int MAX_NODES = 1000;
+    private static final int MAX_NODES_CHARS = 20000;
+
+    /**
+     * Window owners that ARE the system chrome: status bar, navigation bar, notification
+     * shade, gesture strips, and the OEM equivalents that do not live in
+     * com.android.systemui.
+     *
+     * This is matched against the WINDOW's owner package, never against a node's
+     * package. Those two are not interchangeable and the difference is a trap:
+     * AccessibilityNodeInfo.getPackageName() returns "android" for large parts of the
+     * framework's own views, so a node-level test would classify Settings, Camera and
+     * every other ordinary app as system chrome and delete their screens.
+     *
+     * com.coloros.smartsidebar is listed explicitly because ColorOS ships the smart
+     * sidebar (智能侧边栏) and the edge floating bar from there, NOT from systemui, and
+     * their window types are OEM-private numbers (measured ty=2314 / ty=2315) that
+     * Android's TYPE_SYSTEM / TYPE_ACCESSIBILITY_OVERLAY test does not catch. Matching
+     * on the owner package is what makes the check survive an OEM build.
+     */
+    private static final String[] SYSTEM_UI_PACKAGES = {
+            "com.android.systemui",
+            "com.coloros.smartsidebar",
+            "com.oplus.systemui",
+            "com.oplusos.systemui",
+            "com.miui.securityadd",
+            "com.miui.sidebar",
+            "com.samsung.android.app.cocktailbarservice",
+            "com.samsung.android.sidebarservice",
+            "com.huawei.intelligent",
+            "com.vivo.upslide",
+    };
+
+    private static boolean isSystemUiPackage(String p) {
+        if (p == null) return false;
+        String lp = p.toLowerCase();
+        for (String s : SYSTEM_UI_PACKAGES) {
+            if (lp.equals(s) || lp.startsWith(s + ".")) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Window titles that WindowManager reports as owned by a system-chrome package,
+     * keyed by title and by package.
+     *
+     * Why this exists as well as getPackageName(): on this ColorOS build the window
+     * enumeration that UiAutomation hands out does not reliably carry the owner package,
+     * so a package-only test silently matched nothing and the filter was a no-op —
+     * measured as an identical D0 dump with and without the switch. The WindowManager's
+     * own `dumpsys window windows` always states `package=` next to each window, so it is
+     * used to say WHICH window names belong to system chrome; the UiAutomation window is
+     * then matched against that by title.
+     *
+     * Parsed once per dump. The shapes read are:
+     *   Window #12 Window{3f8a2 u0 StatusBar}:
+     *       mOwnerUid=10242 ... package=com.android.systemui ...
+     *   Window #3 Window{607def5 u0 com.tencent.mm/com.tencent.mm.ui.LauncherUI}:
+     *       ... package=com.tencent.mm ...
+     */
+    private static long sChromeTitlesCacheTime = 0;
+    private static java.util.Set<String> sCachedChromeTitles = null;
+
+    private static synchronized java.util.Set<String> systemChromeTitles() {
+        long now = SystemClock.uptimeMillis();
+        if (sCachedChromeTitles != null && (now - sChromeTitlesCacheTime) < 30000) {
+            return sCachedChromeTitles;
+        }
+        java.util.Set<String> titles = querySystemChromeTitlesDirect();
+        if (titles != null && !titles.isEmpty()) {
+            sCachedChromeTitles = titles;
+            sChromeTitlesCacheTime = now;
+            return sCachedChromeTitles;
+        }
+        return titles != null ? titles : (sCachedChromeTitles != null ? sCachedChromeTitles : java.util.Collections.<String>emptySet());
+    }
+
+    private static java.util.Set<String> querySystemChromeTitlesDirect() {
+        java.util.Set<String> titles = new java.util.HashSet<String>();
+        try {
+            Process p = Runtime.getRuntime().exec(
+                    new String[] { "/system/bin/dumpsys", "window", "windows" });
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream()));
+            String line;
+            String pendingTitle = null;
+            while ((line = r.readLine()) != null) {
+                String t = line.trim();
+                int wi = t.indexOf("Window{");
+                if (wi >= 0 && t.startsWith("Window #")) {
+                    // Extract the title: the token after "u<uid> " up to the closing '}'.
+                    int sp = t.indexOf(' ', wi + 7);
+                    int close = t.lastIndexOf('}');
+                    if (sp > 0 && close > sp) {
+                        pendingTitle = t.substring(sp + 1, close).trim();
+                    } else {
+                        pendingTitle = null;
+                    }
+                    continue;
+                }
+                if (pendingTitle != null) {
+                    int pi = t.indexOf("package=");
+                    if (pi >= 0) {
+                        String pkg = t.substring(pi + 8).trim();
+                        int sp2 = pkg.indexOf(' ');
+                        if (sp2 > 0) pkg = pkg.substring(0, sp2);
+                        if (isSystemUiPackage(pkg)) titles.add(pendingTitle);
+                        pendingTitle = null; // one package line per window
+                    }
+                }
+            }
+            try { r.close(); } catch (Throwable ignored) {}
+            try { p.destroy(); } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {
+            // No dumpsys: fall back to the packageName path alone.
+        }
+        return titles;
+    }
+
+    /**
+     * True when this window is system chrome.
+     *
+     * Two independent signals, because neither is sufficient alone on every build:
+     *   1. the window's own getPackageName(), where the platform provides it;
+     *   2. the window's TITLE, matched against the names WindowManager attributes to a
+     *      system-chrome package (see systemChromeTitles).
+     *
+     * A window that matches neither is KEPT. Failing open is deliberate: a build quirk
+     * must not silently delete a real screen, and sys_dropped reports what was removed.
+     */
+    private static boolean isSystemUiWindow(Object win, java.util.Set<String> chromeTitles,
+                                            AccessibilityNodeInfo root) {
+        // 0. Universal window type classification (indiscriminate non-app window filtering):
+        //    TYPE_APPLICATION = 1, TYPE_INPUT_METHOD = 2 are legitimate interactive windows.
+        //    TYPE_SYSTEM = 3, TYPE_ACCESSIBILITY_OVERLAY = 4, or OEM private overlay types (>= 2000)
+        //    are non-app system chrome / assistive floating panels.
+        //
+        //    Android 9 is excluded: measured on MIUI 10 every window of the foreground app is
+        //    reported with a chrome-like type (3/4), so this numeric test would delete the real
+        //    screen. Below API 30 the package/title signals below are the only trusted ones.
+        if (win != null && android.os.Build.VERSION.SDK_INT >= 30) {
+            try {
+                int type = (Integer) win.getClass().getMethod("getType").invoke(win);
+                if (type == 3 || type == 4 || type == 5 || type >= 2000) {
+                    return true;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // 1. The window's own owner package, where the platform exposes one.
+        try {
+            CharSequence pkg = (CharSequence) win.getClass()
+                    .getMethod("getPackageName").invoke(win);
+            if (pkg != null && isSystemUiPackage(pkg.toString())) return true;
+        } catch (Throwable ignored) {
+        }
+        // 2. The ROOT NODE's package. On a window whose root exists this is the reliable
+        //    one: the node is a live AccessibilityNodeInfo the framework filled in, not a
+        //    window-level convenience field, and it is the same value isSystemWindow()
+        //    already reads for its own verdict.
+        if (root != null) {
+            try {
+                CharSequence pkg = root.getPackageName();
+                if (pkg != null && isSystemUiPackage(pkg.toString())) return true;
+            } catch (Throwable ignored) {
+            }
+        }
+        // 3. Title, resolved against WindowManager's own attribution.
+        if (chromeTitles != null && !chromeTitles.isEmpty()) {
+            try {
+                CharSequence t = (CharSequence) win.getClass().getMethod("getTitle").invoke(win);
+                if (t != null && chromeTitles.contains(t.toString().trim())) return true;
+            } catch (Throwable ignored) {
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The one column order every element row uses. Stated once here, emitted once per
+     * dump as the second header line, and never repeated per element — which is the
+     * whole point of the flat format. Before this, every node carried the strings
+     * "id", "type", "b" and so on, and those key names alone were 62% of the payload.
+     *
+     * Fields that contain free text (`name=`, `d=`, `id=`, `hint=`, `tip=`) always sit
+     * at the END, so the rows stay splittable on whitespace no matter what an app puts
+     * in its labels.
+     *
+     * Rows are ordered by usefulness (see rankForBudget) and that order is the ONLY
+     * place the tier is stated: a per-row `pr=` field cost 9% of the payload to repeat
+     * what the line's position already said. The column lines therefore spell the
+     * ordering and the flag letters out ONCE, instead of coding them into every row.
+     */
+    private static final String NODE_COLUMNS =
+            "# one element per row, most useful first: tappable, then own-click, then"
+            + " offscreen-actionable, disabled, label-only, offscreen\n"
+            + "# columns: id type name x1,y1,x2,y2 flags"
+            + " | flags: c=clickable e=editable s=scrollable k+=checked-or-selected k-=unchecked"
+            + " off=disabled gone=offscreen focus=focused wN=window dN=depth"
+            + " | optional: d= extra-desc id= resource how= why-unnamed target= ancestorId@x,y"
+            + " hint= input-hint tip= tooltip";
+
+    /**
+     * Longest free-text field emitted per node. A label is a label, not a paragraph —
+     * but the cut must not destroy the TAIL, because URL query params, order ids and
+     * pickup codes all live there (a chat message whose link ended in
+     * `...?orderId=xyz` was once cut at 140 and the id was lost while `truncated=0`
+     * still reported a healthy dump).
+     *
+     * Measured across 8 rich-text screens (Zhihu, WeChat, Taobao, Meituan, QQ, a
+     * long Baike article, m.zhihu, news feeds) with the cap disabled: the longest
+     * real field was 311 chars and the heaviest whole screen 5131 code points out
+     * of the 23000 pruner threshold. 4000 is therefore a DISASTER WALL (~13x the
+     * measured maximum), not a label budget: one pathological node (novel chapter,
+     * log page) can no longer swallow the 20000-char node budget whole, while all
+     * ordinary content passes untouched.
+     */
+    private static final int MAX_FIELD_CHARS = 4000;
+    /** Tail kept when a field is cut; sized to hold a URL query string. */
+    private static final int FIELD_TAIL_CHARS = 160;
+    /** Head kept; leaves room for the fixed-width marker plus its digit run. */
+    private static final int FIELD_HEAD_CHARS = MAX_FIELD_CHARS - FIELD_TAIL_CHARS - 22;
+
+    /** Inherit an ancestor's click target only when the ancestor is not far bigger. */
+    private static final int MAX_ANCESTOR_RATIO = 4;
+
+    /** An ancestor target covering more than this fraction of the screen is unusable. */
+    private static final double MAX_ANCESTOR_SCREEN_FRACTION = 0.5;
+
+    /**
+     * Retries when the accessibility engine reports no window at all. This is almost
+     * always a timing artifact around an activity transition, not an app that hides its
+     * tree, so it is worth waiting out rather than reporting an empty screen.
+     */
+    private static final int DUMP_ATTEMPTS = 3;
+    private static final int DUMP_RETRY_SLEEP_MS = 350;
+
+    /**
+     * Wait between the two passes. A WebView re-enables its renderer accessibility when it
+     * is queried, but not synchronously, so reading twice in a row without a gap sees the
+     * same disabled tree both times.
+     */
+    private static final int WEBVIEW_WAKE_SLEEP_MS = 600;
+
+    /** In-memory cache of target coordinates from the most recent tree dump (ID -> [x, y]). */
+    private static final java.util.Map<String, int[]> sLastTargetCoords =
+            new java.util.concurrent.ConcurrentHashMap<String, int[]>();
+
+    private static void updateTargetCoords(List<NodeItem> list) {
+        if (list == null) return;
+        sLastTargetCoords.clear();
+        for (int i = 0; i < list.size(); i++) {
+            NodeItem n = list.get(i);
+            int x = (n.targetId > 0 && n.targetId != n.id) ? n.targetCenterX : (n.left + n.right) / 2;
+            int y = (n.targetId > 0 && n.targetId != n.id) ? n.targetCenterY : (n.top + n.bottom) / 2;
+            sLastTargetCoords.put(String.valueOf(n.id), new int[] { x, y });
+        }
+    }
+
+    public static void main(String[] args) {
+        try {
+            run(args);
+        } catch (Throwable t) {
+            // A crash before the command could print anything. Emit the same shape the
+            // commands use so a caller sees a reason rather than an empty answer.
+            System.out.print("fail error=\"" + oneLine(String.valueOf(t)) + "\"");
+            exitNow(1);
+        }
+        exitNow(0);
+    }
+
+    /**
+     * Print-and-stop. Printing without flushing then halting would LOSE the dump:
+     * System.out.print() does not auto-flush, so today the bytes only reach the caller
+     * because the VM flushes on the way out — and the whole point here is to not take
+     * that way out. Everything below this line is a straight teardown saving.
+     */
+    private static void exitNow(int code) {
+        System.out.flush();
+        System.err.flush();
+        Runtime.getRuntime().halt(code);
+    }
+
+    private static void run(String[] args) {
+        try {
+            if (Looper.getMainLooper() == null) {
+                Looper.prepareMainLooper();
+            }
+        } catch (Throwable t) {
+            // ignore if already prepared
+        }
+        if (args.length < 1) {
+            printUsage();
+            return;
+        }
+        String cmd = args[0];
+        if ("daemon".equals(cmd)) {
+            runDaemon();
+        } else if ("apps".equals(cmd) || "list_apps".equals(cmd)) {
+            String query = args.length > 1 ? args[1] : "";
+            listApps(query);
+        } else {
+            printUsage();
+        }
+    }
+
+    private static void printUsage() {
+        System.out.println("Usage: ToolMain <daemon|apps> [args...]");
+    }
+
+    private static void listApps(String query) {
+        String filter = (query != null) ? query.trim().toLowerCase() : "";
+        Context context = null;
+        try {
+            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+            Method systemMainMethod = activityThreadClass.getMethod("systemMain");
+            Object activityThread = systemMainMethod.invoke(null);
+            Method getSystemContextMethod = activityThreadClass.getMethod("getSystemContext");
+            context = (Context) getSystemContextMethod.invoke(activityThread);
+        } catch (Throwable t) {
+            System.err.println("fail error=\"failed to get SystemContext: " + oneLine(String.valueOf(t)) + "\"");
+            exitNow(1);
+            return;
+        }
+
+        if (context == null) {
+            System.err.println("fail error=\"SystemContext is null\"");
+            exitNow(1);
+            return;
+        }
+
+        PackageManager pm = context.getPackageManager();
+        if (pm == null) {
+            System.err.println("fail error=\"PackageManager is null\"");
+            exitNow(1);
+            return;
+        }
+
+        List<Integer> userIds = new ArrayList<Integer>();
+        try {
+            Object userManager = context.getSystemService("user");
+            Method getUsersMethod = userManager.getClass().getMethod("getUsers");
+            List<?> userList = (List<?>) getUsersMethod.invoke(userManager);
+            for (Object userInfo : userList) {
+                int id = userInfo.getClass().getField("id").getInt(userInfo);
+                userIds.add(id);
+            }
+        } catch (Throwable ignored) {
+            userIds.clear();
+            userIds.add(0);
+        }
+        if (userIds.isEmpty()) {
+            userIds.add(0);
+        }
+
+        Intent mainIntent = new Intent(Intent.ACTION_MAIN, null);
+        mainIntent.addCategory(Intent.CATEGORY_LAUNCHER);
+
+        Method queryAsUser = null;
+        try {
+            queryAsUser = pm.getClass().getMethod("queryIntentActivitiesAsUser", Intent.class, int.class, int.class);
+        } catch (Throwable ignored) {}
+
+        List<String> outputLines = new ArrayList<String>();
+
+        for (int uid : userIds) {
+            List<ResolveInfo> list = null;
+            if (queryAsUser != null) {
+                try {
+                    list = (List<ResolveInfo>) queryAsUser.invoke(pm, mainIntent, 0, uid);
+                } catch (Throwable ignored) {}
+            } else if (uid == 0) {
+                list = pm.queryIntentActivities(mainIntent, 0);
+            }
+
+            if (list == null) continue;
+
+            Set<String> seenPackages = new HashSet<String>();
+
+            for (ResolveInfo r : list) {
+                if (r == null || r.activityInfo == null || r.activityInfo.packageName == null) continue;
+                String pkg = r.activityInfo.packageName;
+                if (seenPackages.contains(pkg)) continue;
+                seenPackages.add(pkg);
+
+                CharSequence labelSeq = r.loadLabel(pm);
+                String label = (labelSeq != null) ? labelSeq.toString().trim() : pkg;
+                if (label.isEmpty()) label = pkg;
+
+                String displayLabel = label;
+                if (uid != 0) {
+                    displayLabel = label + " (分身)";
+                }
+
+                if (!filter.isEmpty()) {
+                    if (!displayLabel.toLowerCase().contains(filter) && !pkg.toLowerCase().contains(filter)) {
+                        continue;
+                    }
+                }
+
+                StringBuilder sb = new StringBuilder();
+                sb.append(displayLabel).append(" | ").append(pkg);
+                if (uid != 0) {
+                    sb.append(" | user=").append(uid);
+                }
+                outputLines.add(sb.toString());
+            }
+        }
+
+        StringBuilder header = new StringBuilder();
+        header.append("total=").append(outputLines.size())
+              .append(" users=").append(userIds.toString());
+        if (!filter.isEmpty()) {
+            header.append(" query=\"").append(query).append("\"");
+        }
+        System.out.println(header.toString());
+
+        for (String line : outputLines) {
+            System.out.println(line);
+        }
+        exitNow(0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Persistent Daemon Mode (zero ART cold-start overhead)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static void clearAicCache() {
+        try {
+            Class<?> aicClass = Class.forName("android.view.accessibility.AccessibilityInteractionClient");
+            Method getInstance = aicClass.getMethod("getInstance");
+            Object aic = getInstance.invoke(null);
+            try {
+                Method clear = aicClass.getMethod("clearCache");
+                clear.invoke(aic);
+            } catch (NoSuchMethodException e) {
+                for (Method m : aicClass.getMethods()) {
+                    if ("clearCache".equals(m.getName())) {
+                        if (m.getParameterTypes().length == 0) {
+                            m.invoke(aic);
+                            break;
+                        } else if (m.getParameterTypes().length == 1 && m.getParameterTypes()[0] == int.class) {
+                            m.invoke(aic, 0);
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void runDaemon() {
+        HandlerThread ht = null;
+        Object uiAutomation = null;
+        Class<?> uiClass = null;
+        try {
+            ht = new HandlerThread("UiToolDaemonThread");
+            ht.start();
+
+            Class<?> uacClass = Class.forName("android.app.UiAutomationConnection");
+            Object uac = uacClass.getConstructor().newInstance();
+
+            uiClass = Class.forName("android.app.UiAutomation");
+            Class<?> iuacClass = Class.forName("android.app.IUiAutomationConnection");
+            uiAutomation = uiClass.getConstructor(Looper.class, iuacClass)
+                    .newInstance(ht.getLooper(), uac);
+
+            try {
+                uiClass.getMethod("connect", int.class).invoke(uiAutomation, 0);
+            } catch (NoSuchMethodException e) {
+                uiClass.getMethod("connect").invoke(uiAutomation);
+            }
+
+            AccessibilityServiceInfo info = new AccessibilityServiceInfo();
+            info.eventTypes = -1;
+            info.feedbackType = 16;
+            // 0x2 (INCLUDE_NOT_IMPORTANT) | 0x8 (WEB_ACCESSIBILITY) | 0x10 (VIEW_IDS) | 0x40 (RETRIEVE_INTERACTIVE_WINDOWS)
+            info.flags = 0x2 | 0x8 | 0x10 | 0x40;
+            uiClass.getMethod("setServiceInfo", AccessibilityServiceInfo.class).invoke(uiAutomation, info);
+
+            // Signal to parent process that daemon is fully ready
+            System.out.println("READY");
+            System.out.flush();
+
+            BufferedReader reader = new BufferedReader(new InputStreamReader(System.in, "UTF-8"));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                if ("quit".equals(line) || "exit".equals(line)) {
+                    break;
+                }
+                if ("ping".equals(line)) {
+                    System.out.println("pong");
+                    System.out.println("<<<END_OF_DUMP>>>");
+                    System.out.flush();
+                    continue;
+                }
+                try {
+                    String[] tokens = line.split("\\s+");
+                    String action = tokens[0];
+                    if ("tree".equals(action) || "dump".equals(action)) {
+                        int displayId = tokens.length > 1 ? Integer.parseInt(tokens[1]) : 0;
+                        int budgetOverride = tokens.length > 2 && tokens[2].length() > 0
+                                ? Integer.parseInt(tokens[2]) : 0;
+                        boolean dropSystemUi = (displayId == 0);
+                        for (int ai = 3; ai < tokens.length; ai++) {
+                            if ("--no-system-ui".equals(tokens[ai])) dropSystemUi = true;
+                            if ("--with-system-ui".equals(tokens[ai])) dropSystemUi = false;
+                        }
+                        dumpTreeWithUi(uiAutomation, uiClass, displayId, budgetOverride, dropSystemUi);
+                    } else if ("set_value".equals(action) || "set_value_b64".equals(action)) {
+                        if (tokens.length >= 3) {
+                            int displayId = Integer.parseInt(tokens[1]);
+                            String targetSpec = tokens[2];
+                            String text = "";
+                            if ("set_value_b64".equals(action)) {
+                                if (tokens.length >= 4) {
+                                    try {
+                                        byte[] decoded = android.util.Base64.decode(tokens[3], android.util.Base64.DEFAULT);
+                                        text = new String(decoded, java.nio.charset.StandardCharsets.UTF_8);
+                                    } catch (Throwable b64Err) {
+                                        text = "";
+                                    }
+                                }
+                            } else {
+                                int textIdx = line.indexOf(targetSpec);
+                                if (textIdx >= 0) {
+                                    text = line.substring(textIdx + targetSpec.length()).trim();
+                                }
+                            }
+                            setValueWithUi(uiAutomation, uiClass, displayId, targetSpec, text);
+                        } else {
+                            System.out.print("fail error=\"Invalid " + action + " command in daemon\"");
+                        }
+                    } else if ("resolve".equals(action)) {
+                        if (tokens.length >= 3) {
+                            int displayId = Integer.parseInt(tokens[1]);
+                            String targetId = tokens[2].replaceFirst("^(?i)node:", "").trim();
+                            int[] pt = sLastTargetCoords.get(targetId);
+                            int[] size = queryDisplaySize(displayId);
+                            int dispW = size[0], dispH = size[1];
+                            if (pt != null && (pt[0] < 0 || (dispW > 0 && pt[0] > dispW) || pt[1] < 0 || (dispH > 0 && pt[1] > dispH))) {
+                                pt = null;
+                            }
+                            if (pt == null) {
+                                dumpTreeWithUi(uiAutomation, uiClass, displayId, 0, (displayId == 0), false);
+                                pt = sLastTargetCoords.get(targetId);
+                            }
+                            if (pt != null) {
+                                System.out.print("{\"ok\":true,\"x\":" + pt[0] + ",\"y\":" + pt[1] + ",\"id\":\"" + targetId + "\"}");
+                            } else {
+                                System.out.print("{\"ok\":false,\"error\":\"target_not_found\",\"id\":\"" + targetId + "\"}");
+                            }
+                        } else {
+                            System.out.print("{\"ok\":false,\"error\":\"missing_target_argument\"}");
+                        }
+                    } else {
+                        System.out.print("fail error=\"Unknown command: " + oneLine(line) + "\"");
+                    }
+                } catch (Throwable cmdErr) {
+                    System.out.print("fail error=\"" + oneLine(String.valueOf(cmdErr)) + "\"");
+                } finally {
+                    System.out.println();
+                    System.out.println("<<<END_OF_DUMP>>>");
+                    System.out.flush();
+                    clearAicCache();
+                }
+            }
+        } catch (Throwable t) {
+            System.out.print("fail error=\"Daemon init error: " + oneLine(String.valueOf(t)) + "\"\n<<<END_OF_DUMP>>>\n");
+            System.out.flush();
+        } finally {
+            if (uiAutomation != null && uiClass != null) {
+                try {
+                    uiClass.getMethod("disconnect").invoke(uiAutomation);
+                } catch (Throwable ignored) {}
+            }
+            if (ht != null) {
+                ht.quit();
+            }
+            exitNow(0);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Read-only dump
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static boolean dumpTreeWithUi(Object uiAutomation, Class<?> uiClass,
+                                           int targetDisplayId, int budgetOverride,
+                                           boolean dropSystemUi) {
+        return dumpTreeWithUi(uiAutomation, uiClass, targetDisplayId, budgetOverride, dropSystemUi, true);
+    }
+
+    private static boolean dumpTreeWithUi(Object uiAutomation, Class<?> uiClass,
+                                           int targetDisplayId, int budgetOverride,
+                                           boolean dropSystemUi, boolean emitOutput) {
+        try {
+            // Display geometry: an observation without it leaves the model unable to judge
+            // whether a coordinate is even inside the screen.
+            int[] size = queryDisplaySize(targetDisplayId);
+            int dispW = size[0];
+            int dispH = size[1];
+
+            List<NodeItem> list = null;
+            List<NodeItem> firstList = null;
+            int windowCount = 0;
+            int firstWindows = 0;
+            int firstSize = 0;
+            int firstAppSize = 0;
+            int lastAppSize = 0;
+            // Windows removed by the opt-in --no-system-ui filter, reported as sys_dropped.
+            int droppedSystemUi = 0;
+            // Resolved once, and only when the filter is on: WindowManager's attribution of
+            // which window titles belong to system chrome. Empty when the switch is off, so
+            // the default path pays nothing.
+            java.util.Set<String> chromeTitles = dropSystemUi
+                    ? systemChromeTitles() : java.util.Collections.<String>emptySet();
+            // How many attempts the FIRST scan needed. The rescue loop below can push the
+            // raw counter much higher, and reporting that as `retries` would make a normal
+            // screen look like a struggling one.
+            int scanAttempts = 0;
+            // Set when a rescue scan is what finally produced nodes. The caller is told,
+            // because a payload that needed rescue means the tree was not ready yet — a
+            // model that knows this will not conclude the screen is empty.
+            boolean recovered = false;
+            int attempt = 0;
+
+            // Two-pass scan: recovers transient empty trees during window transitions,
+            // Chromium WebView accessibility wake-up, or intermittent app node availability.
+            for (int pass = 0; pass < 2; pass++) {
+                int appNodeCount = 0;
+                for (attempt = 0; attempt < DUMP_ATTEMPTS; attempt++) {
+                    list = new ArrayList<NodeItem>();
+                    windowCount = 0;
+                    appNodeCount = 0;
+                    int winIndex = 0;
+
+                    List<?> wins = windowsForDisplay(uiAutomation, uiClass, targetDisplayId);
+                    if (wins != null) {
+                        int[] idCounter = new int[] { 1 };
+                        for (Object win : wins) {
+                                // Root first: the system-chrome test needs it (see
+                                // isSystemUiWindow), and the same lookup below reuses it.
+                                Object rootObj;
+                                try {
+                                    rootObj = win.getClass().getMethod("getRoot").invoke(win);
+                                } catch (Throwable t) {
+                                    rootObj = null;
+                                }
+                                AccessibilityNodeInfo rootNode =
+                                        (rootObj instanceof AccessibilityNodeInfo)
+                                                ? (AccessibilityNodeInfo) rootObj : null;
+
+                                // The opt-in system-chrome filter. Dropped windows are NOT
+                                // counted in windowCount, so `windows=` keeps describing the
+                                // tree the caller actually receives rather than the raw
+                                // enumeration; sys_dropped carries the count that was removed.
+                                if (dropSystemUi && isSystemUiWindow(win, chromeTitles, rootNode)) {
+                                    droppedSystemUi++;
+                                    continue;
+                                }
+                                windowCount++;
+                                if (rootNode != null) {
+                                    boolean isSys = isSystemWindow(win, rootNode);
+                                    int beforeSize = list.size();
+                                    collectInteractiveNodes(rootNode, 0,
+                                            null, list, idCounter, winIndex);
+                                    // appNodeCount keeps its ORIGINAL meaning — "nodes from
+                                    // non-system windows" — even when the filter is on. Letting
+                                    // it drift to "nodes from every window" the moment a flag
+                                    // was passed made app_nodes silently change meaning with
+                                    // that flag, and `tree_blocked` is derived from it
+                                    // (appNodeCount == 0), so a screen could start reporting
+                                    // tree_blocked purely because the flag was present.
+                                    if (!isSys) {
+                                        appNodeCount += (list.size() - beforeSize);
+                                    }
+                                }
+                                winIndex++;
+                        }
+                    }
+                    if (pass == 0) scanAttempts = attempt + 1;
+                    // Zero windows is a scan failure and is worth retrying fast; a window
+                    // with no nodes is NOT retried here, because the thing that fixes it is
+                    // time, not repetition — pass 1 owns that case.
+                    if (windowCount > 0) break;
+                    if (attempt < DUMP_ATTEMPTS - 1) {
+                        try { Thread.sleep(DUMP_RETRY_SLEEP_MS); } catch (InterruptedException ignored) {}
+                    }
+                }
+
+                if (pass == 0) {
+                    firstSize = list.size();
+                    firstAppSize = appNodeCount;
+                    lastAppSize = appNodeCount;
+                    firstList = list;
+                    firstWindows = windowCount;
+
+                    // Fast-path: if the screen already yielded a populated node tree and does
+                    // not contain a dormant WebView awaiting accessibility initialization,
+                    // return immediately without paying the 600ms wake sleep and duplicate scan.
+                    // CRITICAL FIX: On the foreground physical display (Display 0), SystemUI's
+                    // status bar contributes ~5-10 permanent nodes. If firstAppSize == 0, the
+                    // main application window is empty or still transitioning!
+                    boolean needWakePass = false;
+                    if (firstWindows > 0 && firstAppSize == 0) {
+                        needWakePass = true; // App window empty or only status bar present: retry with sleep
+                    } else if (hasDormantWebView(list, firstSize)) {
+                        needWakePass = true; // Dormant Chromium WebView: wake and rescan
+                    }
+
+                    if (!needWakePass) {
+                        break;
+                    }
+
+                    // Give a not-yet-ready tree time to appear: a WebView's page content, or
+                    // WeChat's intermittently empty window. The second read is the difference
+                    // between a blank tree and the real one.
+                    try { Thread.sleep(WEBVIEW_WAKE_SLEEP_MS); } catch (InterruptedException ignored) {}
+                } else {
+                    lastAppSize = appNodeCount;
+                    // Keep whichever pass saw more. A thin second pass must not replace a
+                    // thin first one, and a richer second pass is exactly the wake.
+                    if (list.size() <= firstSize) {
+                        list = firstList;
+                        windowCount = firstWindows;
+                        lastAppSize = firstAppSize;
+                    } else if (appNodeCount > firstAppSize) {
+                        // Recovered: second pass found more app content from non-system windows
+                        recovered = true;
+                    }
+                }
+            }
+            if (list == null) list = new ArrayList<NodeItem>();
+
+            // Order matters all the way through: dedup -> semantic hoisting/folding -> tap suppression -> ranking.
+            // Each stage removes or reorders nodes, so it has to see the output of the
+            // one before it.
+            int droppedDup = dedupeIdenticalNodes(list);
+            hoistAndFoldCards(list, dispW, dispH);
+            suppressUnusableTargets(list, dispW, dispH);
+
+            rankForBudget(list);
+
+            if (emitOutput) {
+                emitEnvelope(targetDisplayId, dispW, dispH, windowCount, list,
+                        droppedDup, scanAttempts, recovered, budgetOverride, lastAppSize,
+                        droppedSystemUi);
+                System.out.flush();
+            } else {
+                updateTargetCoords(list);
+            }
+            list.clear();
+            return true;
+        } catch (Throwable t) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("fail error=\"").append(oneLine(String.valueOf(t))).append("\"");
+            System.out.print(sb.toString());
+            System.out.flush();
+            return false;
+        }
+    }
+
+    /**
+     * Detect a WebView whose DOM accessibility tree has not yet populated.
+     * Chromium tears down its accessibility tree after 5s without an active a11y service;
+     * querying it re-enables it asynchronously, returning only outer chrome initially.
+     */
+    private static boolean hasDormantWebView(List<NodeItem> list, int totalSize) {
+        if (list == null || list.isEmpty()) return false;
+        if (totalSize >= 15) return false; // Already populated with page content
+        for (NodeItem n : list) {
+            if (n.type != null && n.type.contains("WebView")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Check if a window or root node belongs to SystemUI (status bar, navigation bar, lockscreen overlay).
+     */
+    private static boolean isSystemWindow(Object win, AccessibilityNodeInfo root) {
+        if (win != null) {
+            try {
+                int type = (Integer) win.getClass().getMethod("getType").invoke(win);
+                // TYPE_SYSTEM = 3, TYPE_ACCESSIBILITY_OVERLAY = 4
+                if (type == 3 || type == 4) return true;
+            } catch (Throwable ignored) {}
+        }
+        if (root != null) {
+            try {
+                CharSequence pkg = root.getPackageName();
+                if (pkg != null && isSystemUiPackage(pkg.toString())) return true;
+            } catch (Throwable ignored) {}
+        }
+        return false;
+    }
+
+    /**
+     * Real display size for the target display. Reflection only, so this cannot fail the
+     * whole dump on an OEM build that hides these APIs.
+     */
+    // ─────────────────────────────────────────────────────────────────────────
+    // Display-aware window enumeration (API 30+ fast path, Android 9 fallback)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static long sTitleMapTime = 0;
+    private static java.util.Map<String, Integer> sTitleMap = null;
+
+    /**
+     * Return the accessibility windows belonging to one display.
+     *
+     * API 30+ answers this directly through getWindowsOnAllDisplays(). Android 9 has no
+     * such method, and AccessibilityWindowInfo carries no display id before API 33, so the
+     * fallback asks WindowManager which window titles live on the target display and filters
+     * the flat getWindows() list by title. Without this, every dump on Android 9 dies with
+     * NoSuchMethodException before a single node is read.
+     */
+    private static List<?> windowsForDisplay(Object uiAutomation, Class<?> uiClass, int targetDisplayId) {
+        try {
+            Object displays = uiClass.getMethod("getWindowsOnAllDisplays").invoke(uiAutomation);
+            if (displays != null) {
+                Class<?> saClass = displays.getClass();
+                int sizeN = (Integer) saClass.getMethod("size").invoke(displays);
+                Method keyAt = saClass.getMethod("keyAt", int.class);
+                Method valueAt = saClass.getMethod("valueAt", int.class);
+                for (int i = 0; i < sizeN; i++) {
+                    int dId = (Integer) keyAt.invoke(displays, i);
+                    if (dId == targetDisplayId) {
+                        List<?> wins = (List<?>) valueAt.invoke(displays, i);
+                        return wins != null ? wins : java.util.Collections.emptyList();
+                    }
+                }
+                return java.util.Collections.emptyList();
+            }
+        } catch (Throwable ignored) {
+            // fall through to the Android 9 path
+        }
+        try {
+            Object winsObj = uiClass.getMethod("getWindows").invoke(uiAutomation);
+            if (!(winsObj instanceof List)) {
+                System.err.println("[ToolMain] getWindows returned " + winsObj);
+            }
+            if (winsObj instanceof List) {
+                List<?> all = (List<?>) winsObj;
+                if (all.isEmpty()) System.err.println("[ToolMain] getWindows list is empty");
+                // Display 0 keeps every window: the status bar / IME are legitimate content there.
+                if (targetDisplayId == 0) return all;
+
+                // On a secondary display only the app that was launched onto it matters.
+                // Accessibility titles are localised app labels ("系统桌面"), NOT the
+                // WindowManager window title, so title matching is only a secondary hint;
+                // the top package of that display is the reliable signal.
+                String pkg = topPackageOnDisplay(targetDisplayId);
+                java.util.Map<String, Integer> titleMap = windowTitleDisplayMap();
+                List<Object> out = new ArrayList<Object>();
+                if (pkg != null) {
+                    for (Object w : all) {
+                        Object root = null;
+                        try {
+                            root = w.getClass().getMethod("getRoot").invoke(w);
+                        } catch (Throwable ignored) {}
+                        if (root instanceof AccessibilityNodeInfo) {
+                            CharSequence rp = ((AccessibilityNodeInfo) root).getPackageName();
+                            if (rp != null && pkg.equals(rp.toString())) {
+                                out.add(w);
+                            }
+                        }
+                    }
+                }
+                if (out.isEmpty()) {
+                    for (Object w : all) {
+                        String title = windowTitle(w);
+                        Integer did = title == null ? null : titleMap.get(title);
+                        if (did != null && did == targetDisplayId) out.add(w);
+                    }
+                }
+                return out;
+            }
+        } catch (Throwable ignored) {
+        }
+        return java.util.Collections.emptyList();
+    }
+
+    /** Minimal integer field reader for the flat JSON written by DaemonMain. */
+    private static int jsonInt(String json, String key, int def) {
+        int i = json.indexOf("\"" + key + "\"");
+        if (i < 0) return def;
+        int colon = json.indexOf(':', i);
+        if (colon < 0) return def;
+        int end = colon + 1;
+        while (end < json.length() && "-0123456789 ".indexOf(json.charAt(end)) >= 0) end++;
+        try {
+            return Integer.parseInt(json.substring(colon + 1, end).trim());
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
+    /** Top activity package on the given display, from `dumpsys activity activities` (cached ~1s). */
+    private static synchronized String topPackageOnDisplay(int displayId) {
+        long now = SystemClock.uptimeMillis();
+        if (sTopPkgCache != null && sTopPkgDisplay == displayId && (now - sTopPkgTime) < 1000) {
+            return sTopPkgCache;
+        }
+        String found = null;
+        try {
+            Process p = Runtime.getRuntime().exec(new String[] { "/system/bin/dumpsys", "activity", "activities" });
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream()));
+            String line;
+            boolean inSection = false;
+            while ((line = r.readLine()) != null) {
+                String t = line.trim();
+                if (t.startsWith("Display #")) {
+                    int hash = t.indexOf('#');
+                    int sp = t.indexOf(' ');
+                    String idStr = hash >= 0 ? t.substring(hash + 1, sp > hash ? sp : t.length()) : "";
+                    try {
+                        inSection = Integer.parseInt(idStr.trim()) == displayId;
+                    } catch (Throwable ignored) {
+                        inSection = false;
+                    }
+                    continue;
+                }
+                if (inSection && t.contains("taskId=")) {
+                    int colon = t.indexOf(": ");
+                    if (colon > 0) {
+                        String comp = t.substring(colon + 2).trim();
+                        int sp = comp.indexOf(' ');
+                        if (sp > 0) comp = comp.substring(0, sp);
+                        int slash = comp.indexOf('/');
+                        if (slash > 0) {
+                            found = comp.substring(0, slash);
+                            break;
+                        }
+                    }
+                }
+            }
+            try { r.close(); } catch (Throwable ignored) {}
+            try { p.destroy(); } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {
+        }
+        sTopPkgCache = found;
+        sTopPkgDisplay = displayId;
+        sTopPkgTime = now;
+        return found;
+    }
+
+    private static String sTopPkgCache = null;
+    private static int sTopPkgDisplay = -1;
+    private static long sTopPkgTime = 0;
+
+    private static String windowTitle(Object win) {
+        try {
+            Object t = win.getClass().getMethod("getTitle").invoke(win);
+            return t == null ? null : t.toString().trim();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** title -> displayId, parsed from `dumpsys window windows` (cached ~1s). */
+    private static synchronized java.util.Map<String, Integer> windowTitleDisplayMap() {
+        long now = SystemClock.uptimeMillis();
+        if (sTitleMap != null && (now - sTitleMapTime) < 1000) return sTitleMap;
+        java.util.Map<String, Integer> map = new java.util.HashMap<String, Integer>();
+        try {
+            Process p = Runtime.getRuntime().exec(new String[] { "/system/bin/dumpsys", "window", "windows" });
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream()));
+            String line;
+            String pendingTitle = null;
+            while ((line = r.readLine()) != null) {
+                String t = line.trim();
+                if (t.startsWith("Window #") && t.contains("Window{")) {
+                    int u = t.indexOf("u0 ");
+                    int close = t.lastIndexOf('}');
+                    if (u > 0 && close > u + 3) {
+                        pendingTitle = t.substring(u + 3, close).trim();
+                    } else {
+                        pendingTitle = null;
+                    }
+                    continue;
+                }
+                if (pendingTitle != null) {
+                    int di = t.indexOf("mDisplayId=");
+                    if (di >= 0) {
+                        String rest = t.substring(di + 11).trim();
+                        int sp = rest.indexOf(' ');
+                        String num = sp > 0 ? rest.substring(0, sp) : rest;
+                        try {
+                            map.put(pendingTitle, Integer.parseInt(num));
+                        } catch (Throwable ignored) {}
+                        pendingTitle = null;
+                    }
+                }
+            }
+            try { r.close(); } catch (Throwable ignored) {}
+            try { p.destroy(); } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {
+        }
+        sTitleMap = map;
+        sTitleMapTime = now;
+        return map;
+    }
+
+    private static int[] queryDisplaySize(int displayId) {
+        // Fast, version-independent source for the daemon's own virtual display:
+        // DisplayManagerGlobal introspection through app_process does not hand out
+        // display info on Android 9, but DaemonMain already published the geometry.
+        try {
+            java.io.File f = new java.io.File("/data/local/tmp/vd_status.json");
+            if (f.exists() && displayId >= 0) {
+                java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f));
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = r.readLine()) != null) sb.append(line);
+                r.close();
+                String json = sb.toString();
+                int did = jsonInt(json, "display_id", -1);
+                int w = jsonInt(json, "width", 0);
+                int h = jsonInt(json, "height", 0);
+                if (did == displayId && w > 0 && h > 0) {
+                    return new int[] { w, h };
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        // A DisplayManager instance gives the reliable answer, but app_process has no
+        // Context. Try, in order: the instrumentation application, then the app-globals
+        // application, then the process's own DisplayManagerGlobal.
+        Object dm = null;
+        try {
+            Object app = Class.forName("android.app.ActivityThread")
+                    .getMethod("currentApplication").invoke(null);
+            if (app == null) {
+                app = Class.forName("android.app.AppGlobals")
+                        .getMethod("getInitialApplication").invoke(null);
+            }
+            if (app != null) {
+                dm = Class.forName("android.content.Context")
+                        .getMethod("getSystemService", String.class).invoke(app, "display");
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            if (dm == null) {
+                Object global = Class.forName("android.hardware.display.DisplayManagerGlobal")
+                        .getMethod("getInstance").invoke(null);
+                dm = Class.forName("android.hardware.display.DisplayManager")
+                        .getConstructor(Class.forName("android.hardware.display.DisplayManagerGlobal"))
+                        .newInstance(global);
+            }
+            if (dm == null) return new int[] { 0, 0 };
+
+            Object display = Class.forName("android.hardware.display.DisplayManager")
+                    .getMethod("getDisplay", int.class).invoke(dm, displayId);
+            if (display == null) return new int[] { 0, 0 };
+
+            Class<?> displayClass = Class.forName("android.view.Display");
+            Class<?> pointClass = Class.forName("android.graphics.Point");
+            Object point = pointClass.getConstructor().newInstance();
+            try {
+                displayClass.getMethod("getRealSize", pointClass).invoke(display, point);
+            } catch (NoSuchMethodException e) {
+                displayClass.getMethod("getSize", pointClass).invoke(display, point);
+            }
+            int w = (Integer) pointClass.getField("x").get(point);
+            int h = (Integer) pointClass.getField("y").get(point);
+            return new int[] { w, h };
+        } catch (Throwable t) {
+            return new int[] { 0, 0 };
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Post-processing passes
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Collapse nodes that are indistinguishable on screen.
+     *
+     * Android nests container after container at byte-identical bounds (Taobao rendered
+     * "淘工厂" three times at [31,406,238,623]), and those copies were eating the token
+     * budget that the bottom half of the screen needed. Two nodes are the same element to
+     * a model that only sees (bounds, text, desc), so they are merged: the keeper takes
+     * over every interaction flag.
+     *
+     * A text node inside a textless container is KEPT — that node holds the only label
+     * for the pair, so collapsing the pair would destroy the label.
+     *
+     * @return how many nodes were dropped
+     */
+    private static int dedupeIdenticalNodes(List<NodeItem> list) {
+        Map<String, Integer> firstSeen = new HashMap<String, Integer>();
+        List<NodeItem> out = new ArrayList<NodeItem>(list.size());
+        int dropped = 0;
+        for (NodeItem n : list) {
+            String key = n.left + ":" + n.top + ":" + n.right + ":" + n.bottom
+                    + "|" + norm(n.text) + "|" + norm(n.desc);
+            Integer at = firstSeen.get(key);
+            if (at == null) {
+                firstSeen.put(key, out.size());
+                out.add(n);
+                continue;
+            }
+            NodeItem keep = out.get(at);
+            boolean keepHasOwnSemantic = nonEmpty(keep.text) || nonEmpty(keep.desc)
+                    || nonEmpty(keep.hint) || nonEmpty(keep.tooltip);
+            if (keep.clickable || !keepHasOwnSemantic) {
+                mergeInto(keep, n);
+                dropped++;
+            } else {
+                // The earlier node is only a label holder; this one carries the
+                // interaction. Fold the label forward and drop the earlier node.
+                mergeInto(n, keep);
+                out.set(at, n);
+                dropped++;
+            }
+        }
+        return dropped;
+    }
+
+    /** Absorb every interaction flag and the tighter click target of {@code from}. */
+    private static void mergeInto(NodeItem keep, NodeItem from) {
+        keep.clickable |= from.clickable;
+        keep.editableFlag |= from.editableFlag;
+        keep.checkable |= from.checkable;
+        keep.checked |= from.checked;
+        keep.selected |= from.selected;
+        keep.scrollable |= from.scrollable;
+        keep.focused |= from.focused;
+        keep.folded |= from.folded;
+        // A label is the whole reason a node is worth keeping; never let a merge that
+        // only happens to reconstruct interaction state throw one away. The later node
+        // fills only what the keeper is still missing.
+        if (!nonEmpty(keep.text) && nonEmpty(from.text)) keep.text = from.text;
+        if (!nonEmpty(keep.desc) && nonEmpty(from.desc)) keep.desc = from.desc;
+        if (!nonEmpty(keep.hint) && nonEmpty(from.hint)) keep.hint = from.hint;
+        if (!nonEmpty(keep.tooltip) && nonEmpty(from.tooltip)) keep.tooltip = from.tooltip;
+        if (!nonEmpty(keep.viewId) && nonEmpty(from.viewId)) keep.viewId = from.viewId;
+        if (from.clickable) {
+            // A self-target always beats an inherited one.
+            keep.targetId = keep.id;
+            keep.targetCenterX = keep.centerX;
+            keep.targetCenterY = keep.centerY;
+            keep.targetRatio = 1;
+            keep.tapReason = null;
+        } else if (from.targetId > 0 && keep.targetId <= 0) {
+            keep.targetId = from.targetId;
+            keep.targetCenterX = from.targetCenterX;
+            keep.targetCenterY = from.targetCenterY;
+            keep.targetRatio = from.targetRatio;
+            keep.tapReason = from.tapReason;
+        }
+    }
+
+    /**
+     * Second pass: drop inherited click targets that would actively mislead.
+     *
+     * Two shapes are worse than no answer at all:
+     *   - a scrollable container inheriting a target: tapping its centre just scrolls,
+     *     and the model reads that as "the tap did nothing";
+     *   - a target covering more than half the screen: it is a layout wrapper, not a
+     *     control, so the tap lands wherever the wrapper happens to be centred.
+     * The node keeps its own `click`; only the inherited `tap` goes away, and `why` says so.
+     */
+    private static void suppressUnusableTargets(List<NodeItem> list, int dispW, int dispH) {
+        long screenArea = (dispW > 0 && dispH > 0) ? (long) dispW * dispH : 0L;
+        for (NodeItem n : list) {
+            if (n.targetId <= 0 || n.targetId == n.id) continue;
+            if (n.scrollable) {
+                n.targetId = -1;
+                n.tapReason = "scrollable";
+                continue;
+            }
+            if (screenArea > 0) {
+                long selfArea = Math.max(1L, (long) (n.right - n.left) * (n.bottom - n.top));
+                long targetArea = selfArea * Math.max(1, n.targetRatio); // target ~ ratio x self
+                if (targetArea > screenArea * MAX_ANCESTOR_SCREEN_FRACTION) {
+                    n.targetId = -1;
+                    n.tapReason = "target>halfscreen";
+                }
+            }
+        }
+    }
+
+    /**
+     * Order nodes so that if the budget runs out, it runs out on the least useful content.
+     *
+     * The salary of this pass is the bottom of the screen: the old greedy tree-order fill
+     * stopped dead at y=2444 on Taobao and the model never learned the rest existed.
+     * Ranking keeps a node's absolute position as the final tiebreak, so the emitted list
+     * still reads roughly top-to-bottom.
+     *
+     * Tiers, best first:
+     *   0  on-screen label with a resolved tap target (the model can act on it now)
+     *   1  on-screen, actionable on its own `click`
+     *   2  off-screen but actionable (a valid target once scrolled to)
+     *   3  disabled
+     *   4  on-screen, nothing to act on (labels and context)
+     *   5  off-screen, nothing to act on
+     */
+    private static void rankForBudget(List<NodeItem> list) {
+        List<Ranked> ranked = new ArrayList<Ranked>(list.size());
+        for (int i = 0; i < list.size(); i++) {
+            NodeItem n = list.get(i);
+            n.priority = priorityOf(n);
+            n.actionBearing = isActionBearing(n);
+            // Document order is both the tiebreak and the keeper of the reading order.
+            ranked.add(new Ranked(n, i));
+        }
+        Collections.sort(ranked);
+        for (int i = 0; i < ranked.size(); i++) list.set(i, ranked.get(i).node);
+    }
+
+    private static int priorityOf(NodeItem n) {
+        boolean interactive = n.clickable || n.checkable || n.editableFlag;
+        if (!interactive) return n.visibleToUser ? 4 : 5;
+        if (!n.enabled) return 3;
+        if (n.visibleToUser) return (n.targetId > 0 && n.targetId != n.id) ? 0 : 1;
+        return 2;
+    }
+
+    /** Heuristic for the within-tier tiebreak; deliberately conservative. */
+    private static boolean isActionBearing(NodeItem n) {
+        if (n.checkable || n.editableFlag) return false;
+        if (!n.clickable) return n.targetId > 0;
+        return true;
+    }
+
+    /** Sort key: usefulness tier, then document order. */
+    static class Ranked implements Comparable<Ranked> {
+        final NodeItem node;
+        final int seq;
+
+        Ranked(NodeItem node, int seq) {
+            this.node = node;
+            this.seq = seq;
+        }
+
+        public int compareTo(Ranked o) {
+            if (node.priority != o.node.priority) return node.priority - o.node.priority;
+            if (node.actionBearing != o.node.actionBearing) return node.actionBearing ? -1 : 1;
+            if (seq != o.seq) return seq - o.seq;
+            return node.id - o.node.id;
+        }
+    }
+
+    private static String norm(String s) {
+        return s == null ? "" : s.trim();
+    }
+
+    /**
+     * Serialize the observation.
+     *
+     * Envelope carries display geometry, window count and truncation state, so the model can
+     * tell apart: screen is genuinely empty / accessibility tree suppressed / output clipped /
+     * dump failed. Each node carries only raw signals plus a resolved click target.
+     */
+    private static void emitEnvelope(int displayId, int dispW, int dispH,
+                                     int windowCount, List<NodeItem> list,
+                                     int droppedDup,
+                                     int scanAttempts, boolean recovered, int budgetOverride,
+                                     int appNodeCount, int droppedSystemUi) {
+        updateTargetCoords(list);
+        int total = list.size();
+        StringBuilder nodes = new StringBuilder();
+        int emitted = 0;
+        boolean truncated = false;
+        int omitted = 0;
+        // Lossless accounting: how many nodes in the ENTIRE tree are actionable
+        // (clickable / checkable), and how many of those actually reached the model.
+        // Without this, "truncated" only says the budget ran out, not whether anything
+        // the model could have tapped was lost — and comparing two dumps taken seconds
+        // apart cannot answer it either, because the screen changes in between.
+        int actTotal = 0;
+        int actSent = 0;
+        int omittedMinPriority = Integer.MAX_VALUE;
+        boolean omittedTopTier = false;
+        int fullMinX = Integer.MAX_VALUE, fullMaxX = Integer.MIN_VALUE;
+        int fullMinY = Integer.MAX_VALUE, fullMaxY = Integer.MIN_VALUE;
+
+        for (int i = 0; i < total; i++) {
+            NodeItem n = list.get(i);
+            if (n.left < fullMinX) fullMinX = n.left;
+            if (n.right > fullMaxX) fullMaxX = n.right;
+            if (n.top < fullMinY) fullMinY = n.top;
+            if (n.bottom > fullMaxY) fullMaxY = n.bottom;
+            // Count only nodes that would actually render. Counting every raw clickable
+            // node reports a phantom loss, because renderNode drops some of them as noise
+            // and act_sent can then never reach act_total however large the budget is.
+            if ((n.clickable || n.checkable) && isEmittable(n, dispW, dispH)) actTotal++;
+        }
+
+        for (int i = 0; i < total; i++) {
+            int charBudget = budgetOverride > 0 ? budgetOverride : MAX_NODES_CHARS;
+            int nodeBudget = budgetOverride > 0 ? Integer.MAX_VALUE : MAX_NODES;
+            if (emitted >= nodeBudget || nodes.length() >= charBudget) {
+                // Everything still queued is a candidate for omission, but only nodes that
+                // would actually have rendered count — otherwise `omitted` reports noise
+                // the caller was never going to see.
+                truncated = true;
+                for (int k = i; k < total; k++) {
+                    NodeItem n = list.get(k);
+                    if (!isEmittable(n, dispW, dispH)) continue;
+                    omitted++;
+                    if (n.priority < omittedMinPriority) omittedMinPriority = n.priority;
+                    // Tier 1 is "on screen, actionable through its own click" — a real
+                    // control the model can tap. Measured on Amap, where the budget cut
+                    // straight into tier 1 and silently dropped 查路线 and 我的位置 with no
+                    // signal at all, because only tier 0 was treated as top-tier.
+                    if (n.priority <= 1) omittedTopTier = true;
+                }
+                break;
+            }
+            String s = renderNode(list.get(i), dispW, dispH, list);
+            if (s == null) continue;
+            if (emitted > 0) nodes.append("\n");
+            nodes.append(s);
+            emitted++;
+            if (list.get(i).clickable || list.get(i).checkable) actSent++;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("ok display=").append(displayId);
+        sb.append(" size=").append(dispW).append("x").append(dispH);
+        sb.append(" windows=").append(windowCount);
+        // Only emitted when non-zero, so the default (unfiltered) header is byte-identical
+        // to what every existing caller already parses. Its absence therefore means "the
+        // filter was off", not "nothing was dropped" — and a present sys_dropped is the
+        // only way a reader can tell a screen that genuinely has no system chrome from one
+        // whose chrome was removed.
+        if (droppedSystemUi > 0) sb.append(" sys_dropped=").append(droppedSystemUi);
+        if (fullMinX != Integer.MAX_VALUE && (fullMinX < 0 || fullMaxX > dispW)) {
+            sb.append(" x_extent=").append(fullMinX).append(",").append(fullMaxX);
+        }
+        if (fullMinY != Integer.MAX_VALUE && (fullMinY < 0 || fullMaxY > dispH)) {
+            sb.append(" y_extent=").append(fullMinY).append(",").append(fullMaxY);
+        }
+        sb.append(" total=").append(total);
+        if (scanAttempts > 0) sb.append(" retries=").append(scanAttempts);
+        // The tree was not there on the first read and appeared on a retry. Reported
+        // because it changes how a later empty result should be read: WeChat returns an
+        // empty window intermittently rather than refusing outright (measured 0,0,0,68,0,70
+        // on one unchanged screen), so "it worked a minute ago" is not a contradiction.
+        if (recovered) sb.append(" recovered=1");
+        // Three ways to end up with no nodes, and they call for different reactions.
+        // Each is now named for what it actually is:
+        //   no_windows   the engine returned no window object at all (a scan failure)
+        //   tree_blocked a window exists but getRoot() yielded nothing. NOTE: this is NOT
+        //                proof that the app withholds its tree. WeChat lands here
+        //                intermittently — the same unchanged screen returned 0 nodes on
+        //                four scans and 68/70 on two others — so treat it as "not readable
+        //                right now" and re-read before concluding anything, and check
+        //                `recovered` on a later call.
+        // Both are `ok:true` — the call succeeded, the screen just has no readable tree.
+        if (windowCount == 0) {
+            sb.append(" no_windows=1");
+        } else if (total == 0 || appNodeCount == 0) {
+            sb.append(" tree_blocked=1");
+        }
+        sb.append(" app_nodes=").append(appNodeCount);
+        if (droppedDup > 0) sb.append(" dup=").append(droppedDup);
+        sb.append(" returned=").append(emitted);
+        sb.append(" act_sent=").append(actSent);
+        sb.append(" act_total=").append(actTotal);
+        sb.append(" truncated=").append(truncated ? 1 : 0);
+        if (truncated) {
+            // Report omitted count and top-tier loss indicators when truncated
+            sb.append(" omitted=").append(omitted);
+            if (omittedTopTier) sb.append(" omitted_top=1");
+            if (omittedMinPriority != Integer.MAX_VALUE) {
+                sb.append(" omitted_min=").append(omittedMinPriority);
+            }
+        }
+        sb.append("\n").append(NODE_COLUMNS).append("\n");
+        sb.append(nodes);
+        System.out.print(sb.toString());
+    }
+
+    /**
+     * Renders one node as ONE line, or null when it must be dropped as noise.
+     *
+     * Shape: id type "label" x1,y1,x2,y2 flags, then optional labelled fields, then the
+     * free-text fields last. `list` is the full ranked list, needed only to answer one
+     * question about a silent node — "is everything it contains also tappable on its
+     * own?" — which is what tells a real unlabelled control apart from a layout wrapper.
+     */
+    private static String renderNode(NodeItem n, int dispW, int dispH, List<NodeItem> list) {
+        if (!isEmittable(n, dispW, dispH)) return null;
+        boolean visible = n.visibleToUser && withinScreen(n, dispW, dispH);
+
+        // One label, not two. When the app gives both text and a content-desc, the
+        // richer one is worth a look instead of a mechanical preference for `text`:
+        // Settings rows carry the short title in `text` and the sentence that says what
+        // the row does in `desc`, and only the second one tells the model what it gets.
+        String text = nonEmpty(n.text) ? n.text : "";
+        String desc = nonEmpty(n.desc) ? n.desc : "";
+        String label;
+        String extra = null;
+        if (nonEmpty(text) && nonEmpty(desc) && !text.equals(desc)) {
+            label = text.length() >= desc.length() ? text : desc;
+            extra = desc;
+        } else {
+            label = nonEmpty(text) ? text : desc;
+        }
+        // An icon-only control often explains itself in one of the two fields the tool
+        // used to never read, so a node that is silent everywhere else is not yet silent.
+        boolean hasLabel = nonEmpty(label) || nonEmpty(n.hint) || nonEmpty(n.tooltip);
+        String how = null;
+        if (!hasLabel) how = maybeReason(n, list, visible);
+
+        StringBuilder row = new StringBuilder();
+        row.append(n.id).append(' ').append(simplifyType(n.type));
+        if (hasLabel) row.append(" \"").append(oneLine(label)).append('"');
+        row.append(' ').append(n.left).append(',').append(n.top).append(',')
+           .append(n.right).append(',').append(n.bottom);
+
+        if (n.clickable) row.append(" c");
+        if (n.editableFlag) row.append(" e");
+        if (n.scrollable) row.append(" s");
+        if (n.checkable) row.append(n.checked ? " k+" : " k-");
+        else if (n.selected) row.append(" k+");
+        if (!n.enabled) row.append(" off");
+        if (!visible) row.append(" gone");
+        if (n.focused) row.append(" focus");
+        if (n.windowIndex > 0) row.append(" w").append(n.windowIndex);
+        if (n.depth > 0) row.append(" d").append(n.depth);
+
+        // `desc` only when the label above is the other field's text.
+        if (extra != null) row.append(" d=\"").append(oneLine(extra)).append('"');
+        // The resource name is the only identifier a caller can echo back verbatim, so
+        // it is worth its bytes even though it repeats part of the label. Package is
+        // dropped: the package is constant for a whole screen and identifies nothing.
+        if (nonEmpty(n.viewId)) row.append(" id=").append(shortResource(n.viewId));
+        if (how != null) row.append(" how=").append(how);
+
+        // The resolved ancestor target. Only when it actually differs from this node's
+        // own box: `tap_x=1` used to emit the node's own centre (and its id, and its
+        // ratio) three more times per node, which is pure duplication.
+        if (n.targetId > 0 && n.targetId != n.id) {
+            row.append(" target=").append(n.targetId).append('@')
+               .append(n.targetCenterX).append(',').append(n.targetCenterY);
+        }
+        if (nonEmpty(n.hint)) row.append(" hint=\"").append(oneLine(n.hint)).append('"');
+        if (nonEmpty(n.tooltip)) row.append(" tip=\"").append(oneLine(n.tooltip)).append('"');
+        return row.toString();
+    }
+
+    /**
+     * Why a node is worth emitting even though it says nothing about itself.
+     *
+     * Silence used to be ambiguous in the worst way: the model could not tell an
+     * unlabelled button — which it should try — from a layout wrapper that only looks
+     * tappable because a child inside it is, which it should not. Measured on this
+     * tool's own logs, 433 of 1239 actionable nodes carried no readable name, and 65 of
+     * those were full-screen wrappers.
+     */
+    private static String maybeReason(NodeItem n, List<NodeItem> list, boolean visible) {
+        if (!visible) return "offscreen";
+        if (!n.enabled) return "disabled";
+        if (!n.clickable && !n.checkable) {
+            // Nothing acts here; the node is only a spatial anchor, so there is no
+            // ambiguity to resolve and no reason to spend bytes on one.
+            return n.scrollable ? "scrollonly" : null;
+        }
+        // "Everything I contain is tappable on its own" is the definition of a wrapper:
+        // tapping it lands on whatever child happens to sit at its centre. The same
+        // geometric test also catches the ancestor chains AutoDroid clears with
+        // _adjust_view_clickability, without mutating the tree.
+        if (containsClickable(n, list)) return "wraps";
+        if (containsAnySemantic(n, list)) return "wraps";
+        return "unlabeled";
+    }
+
+    /** Whether any other tappable node lies strictly inside this node's box. */
+    private static boolean containsClickable(NodeItem n, List<NodeItem> list) {
+        long selfArea = Math.max(1L, (long) (n.right - n.left) * (n.bottom - n.top));
+        for (NodeItem m : list) {
+            if (m == n || m.id == n.id) continue;
+            if (!(m.clickable || m.checkable)) continue;
+            if (m.left < n.left || m.top < n.top || m.right > n.right || m.bottom > n.bottom) continue;
+            long area = Math.max(1L, (long) (m.right - m.left) * (m.bottom - m.top));
+            // A child that is not meaningfully smaller is the same element re-reported,
+            // not a nested target.
+            if (area * 10L < selfArea * 9L) return true;
+        }
+        return false;
+    }
+
+    /** Whether any node with non-empty text or desc lies strictly inside this node's box. */
+    private static boolean containsAnySemantic(NodeItem n, List<NodeItem> list) {
+        long selfArea = Math.max(1L, (long) (n.right - n.left) * (n.bottom - n.top));
+        for (NodeItem m : list) {
+            if (m == n || m.id == n.id) continue;
+            if (!nonEmpty(m.text) && !nonEmpty(m.desc)) continue;
+            if (m.left < n.left || m.top < n.top || m.right > n.right || m.bottom > n.bottom) continue;
+            long area = Math.max(1L, (long) (m.right - m.left) * (m.bottom - m.top));
+            if (area * 10L < selfArea * 9L) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Hoist semantic text from non-interactive children into textless clickable containers (cards/items),
+     * and fold the consumed text-only leaf nodes to save tokens and eliminate misleading "unlabeled" nodes.
+     *
+     * Guards:
+     *   - Only containers <= 40% of the screen area and height <= 900px (no screen-wide wrappers / backgrounds).
+     *   - Only non-interactive children (clickable/checkable/editable children are NEVER folded).
+     *   - Text children belonging to a nested smaller clickable container are NOT stolen by the outer parent.
+     *   - Concatenated text length is capped to prevent long body text from blowing up the label.
+     */
+    private static void hoistAndFoldCards(List<NodeItem> list, int dispW, int dispH) {
+        if (list == null || list.isEmpty()) return;
+        long screenArea = (dispW > 0 && dispH > 0) ? (long) dispW * dispH : 0L;
+
+        for (int i = 0; i < list.size(); i++) {
+            NodeItem parent = list.get(i);
+            if (!parent.clickable) continue;
+            if (parent.scrollable) continue;
+            if (nonEmpty(parent.text) || nonEmpty(parent.desc)) continue;
+
+            long parentArea = Math.max(1L, (long) (parent.right - parent.left) * (parent.bottom - parent.top));
+            if (screenArea > 0 && parentArea > screenArea * 2 / 5) continue;
+            if (parent.bottom - parent.top > 900) continue;
+
+            List<NodeItem> textChildren = new ArrayList<NodeItem>();
+            boolean hasSubClickable = false;
+
+            for (int j = 0; j < list.size(); j++) {
+                if (i == j) continue;
+                NodeItem child = list.get(j);
+                if (child.windowIndex != parent.windowIndex) continue;
+                if (child.left < parent.left || child.top < parent.top
+                        || child.right > parent.right || child.bottom > parent.bottom) {
+                    continue;
+                }
+                if (child.depth <= parent.depth) continue;
+
+                if (child.clickable || child.checkable || child.editableFlag) {
+                    long childArea = Math.max(1L, (long) (child.right - child.left) * (child.bottom - child.top));
+                    if (childArea * 10L < parentArea * 9L) {
+                        hasSubClickable = true;
+                    }
+                    continue;
+                }
+
+                if (nonEmpty(child.text) || nonEmpty(child.desc)) {
+                    textChildren.add(child);
+                }
+            }
+
+            if (textChildren.isEmpty()) continue;
+
+            List<NodeItem> directTextChildren = new ArrayList<NodeItem>();
+            for (NodeItem tc : textChildren) {
+                boolean insideSub = false;
+                if (hasSubClickable) {
+                    for (int j = 0; j < list.size(); j++) {
+                        if (i == j) continue;
+                        NodeItem mid = list.get(j);
+                        if (!mid.clickable && !mid.checkable) continue;
+                        if (mid.depth <= parent.depth || tc.depth <= mid.depth) continue;
+                        if (tc.left >= mid.left && tc.top >= mid.top && tc.right <= mid.right && tc.bottom <= mid.bottom) {
+                            insideSub = true;
+                            break;
+                        }
+                    }
+                }
+                if (!insideSub) {
+                    directTextChildren.add(tc);
+                }
+            }
+
+            if (directTextChildren.isEmpty()) continue;
+
+            List<NodeItem> orderedChildren = sortVisuallyInReadingOrder(directTextChildren);
+
+            StringBuilder hoisted = new StringBuilder();
+            String lastText = "";
+            List<NodeItem> consumed = new ArrayList<NodeItem>();
+            for (NodeItem tc : orderedChildren) {
+                String t = nonEmpty(tc.text) ? tc.text.trim() : (nonEmpty(tc.desc) ? tc.desc.trim() : "");
+                if (t.isEmpty() || t.equals(lastText)) {
+                    consumed.add(tc);
+                    continue;
+                }
+                if (hoisted.length() > 0) {
+                    if (hoisted.toString().contains(t)) {
+                        consumed.add(tc);
+                        continue;
+                    }
+                    boolean glue = shouldGlue(lastText, t);
+                    int addedLen = (glue ? 0 : 1) + t.length();
+                    if (hoisted.length() + addedLen > MAX_FIELD_CHARS) {
+                        break;
+                    }
+                    if (!glue) {
+                        hoisted.append(' ');
+                    }
+                } else {
+                    if (t.length() > MAX_FIELD_CHARS) {
+                        break;
+                    }
+                }
+                hoisted.append(t);
+                lastText = t;
+                consumed.add(tc);
+                if (hoisted.length() >= MAX_FIELD_CHARS) break;
+            }
+
+            if (hoisted.length() == 0) continue;
+
+            parent.text = hoisted.toString();
+            parent.targetId = parent.id;
+            parent.targetCenterX = parent.centerX;
+            parent.targetCenterY = parent.centerY;
+            parent.targetRatio = 1;
+            parent.tapReason = null;
+
+            for (NodeItem tc : consumed) {
+                tc.folded = true;
+            }
+        }
+
+        Iterator<NodeItem> it = list.iterator();
+        while (it.hasNext()) {
+            if (it.next().folded) {
+                it.remove();
+            }
+        }
+    }
+
+    private static class VisualLine {
+        int top = Integer.MAX_VALUE;
+        int bottom = Integer.MIN_VALUE;
+        List<NodeItem> nodes = new ArrayList<NodeItem>();
+    }
+
+    /**
+     * Group items into visual lines based on vertical overlap (>=40%), then sort within each
+     * line strictly by X coordinate (left-to-right), and finally flatten lines top-to-bottom.
+     * This eliminates text inversion caused by baseline-aligned small currency symbols or subscripts.
+     */
+    private static List<NodeItem> sortVisuallyInReadingOrder(List<NodeItem> items) {
+        if (items == null || items.size() <= 1) return items;
+
+        List<NodeItem> sorted = new ArrayList<NodeItem>(items);
+        Collections.sort(sorted, new Comparator<NodeItem>() {
+            @Override
+            public int compare(NodeItem a, NodeItem b) {
+                if (a.top != b.top) return Integer.compare(a.top, b.top);
+                return Integer.compare(a.left, b.left);
+            }
+        });
+
+        List<VisualLine> lines = new ArrayList<VisualLine>();
+        for (NodeItem item : sorted) {
+            int h = Math.max(1, item.bottom - item.top);
+            VisualLine bestLine = null;
+            double maxOverlapRatio = 0.0;
+
+            for (VisualLine line : lines) {
+                int overlap = Math.max(0, Math.min(item.bottom, line.bottom) - Math.max(item.top, line.top));
+                if (overlap > 0) {
+                    int lineH = Math.max(1, line.bottom - line.top);
+                    int minH = Math.min(h, lineH);
+                    double ratio = (double) overlap / minH;
+                    if (ratio >= 0.4 && ratio > maxOverlapRatio) {
+                        maxOverlapRatio = ratio;
+                        bestLine = line;
+                    }
+                }
+            }
+
+            if (bestLine != null) {
+                bestLine.nodes.add(item);
+                bestLine.top = Math.min(bestLine.top, item.top);
+                bestLine.bottom = Math.max(bestLine.bottom, item.bottom);
+            } else {
+                VisualLine newLine = new VisualLine();
+                newLine.top = item.top;
+                newLine.bottom = item.bottom;
+                newLine.nodes.add(item);
+                lines.add(newLine);
+            }
+        }
+
+        Collections.sort(lines, new Comparator<VisualLine>() {
+            @Override
+            public int compare(VisualLine a, VisualLine b) {
+                return Integer.compare(a.top, b.top);
+            }
+        });
+
+        List<NodeItem> result = new ArrayList<NodeItem>(items.size());
+        for (VisualLine line : lines) {
+            Collections.sort(line.nodes, new Comparator<NodeItem>() {
+                @Override
+                public int compare(NodeItem a, NodeItem b) {
+                    return Integer.compare(a.left, b.left);
+                }
+            });
+            result.addAll(line.nodes);
+        }
+        return result;
+    }
+
+    private static boolean shouldGlue(String prev, String curr) {
+        if (prev == null || prev.isEmpty() || curr == null || curr.isEmpty()) return false;
+        if (isCurrencySymbol(prev)) return true;
+        if (curr.startsWith(".")) return true;
+        if (prev.endsWith(".") && Character.isDigit(curr.charAt(0))) return true;
+        return false;
+    }
+
+    private static boolean isCurrencySymbol(String s) {
+        if (s == null || s.isEmpty()) return false;
+        String trimmed = s.trim();
+        return trimmed.equals("¥") || trimmed.equals("￥") || trimmed.equals("$")
+                || trimmed.equals("€") || trimmed.equals("£") || trimmed.equals("¢")
+                || trimmed.equals("RMB") || trimmed.equals("USD");
+    }
+
+    /** `com.sankuai.meituan:id/k71` -> `k71`; the package is screen-constant noise. */
+    private static String shortResource(String viewId) {
+        int slash = viewId.lastIndexOf('/');
+        String local = slash >= 0 ? viewId.substring(slash + 1) : viewId;
+        return local.length() > 0 ? local : viewId;
+    }
+
+    /**
+     * Flatten and cap a free-text field so it can never break the one-row-per-node
+     * grid. Under the cap the field is emitted verbatim (after flattening); over it,
+     * the field keeps its head AND its tail with an explicit `...[cut:N]...` marker
+     * naming the dropped length — head-only cuts silently destroyed the only part
+     * that mattered whenever the payload was a URL.
+     */
+    private static String oneLine(String s) {
+        if (s == null) return "";
+        StringBuilder flat = new StringBuilder(Math.min(s.length(), MAX_FIELD_CHARS + 8));
+        boolean lastSpace = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\n' || c == '\r' || c == '\t' || c == '"') c = ' ';
+            boolean space = Character.isWhitespace(c);
+            if (space && lastSpace) continue;
+            flat.append(c);
+            lastSpace = space;
+        }
+        // The cut decision is on the FLATTENED length: that is what the row costs.
+        if (flat.length() <= MAX_FIELD_CHARS) return flat.toString();
+        int dropped = flat.length() - FIELD_HEAD_CHARS - FIELD_TAIL_CHARS;
+        return flat.substring(0, FIELD_HEAD_CHARS)
+                + "...[cut:" + dropped + "]..."
+                + flat.substring(flat.length() - FIELD_TAIL_CHARS);
+    }
+
+    /**
+     * Whether a node earns its place in the output.
+     *
+     * Kept separate from renderNode so the omission count and the renderer can never
+     * disagree about what counts as content.
+     */
+    private static boolean isEmittable(NodeItem n, int dispW, int dispH) {
+        // A node with no semantics AND no interaction is noise for the model.
+        boolean hasSemantic = nonEmpty(n.text) || nonEmpty(n.desc);
+        boolean interactive = n.clickable || n.checkable || n.scrollable || n.editableFlag;
+        if (!hasSemantic && !interactive) return false;
+
+        // isVisibleToUser can lag for off-screen content; the geometry check is the
+        // reliable part and the two agree on the rows we measured.
+        boolean visible = n.visibleToUser && withinScreen(n, dispW, dispH);
+        // Drop only invisible content that offers nothing to act on. Invisible but
+        // clickable nodes stay, flagged, because they are still valid tap targets
+        // once the user scrolls.
+        if (!visible && !interactive) return false;
+        return true;
+    }
+
+    private static boolean withinScreen(NodeItem n, int dispW, int dispH) {
+        if (dispW <= 0 || dispH <= 0) return true; // geometry unknown: do not over-filter
+        return n.right > 0 && n.bottom > 0 && n.left < dispW && n.top < dispH;
+    }
+
+    private static boolean nonEmpty(String s) {
+        if (s == null) return false;
+        for (int i = 0; i < s.length(); i++) {
+            if (!Character.isWhitespace(s.charAt(i))) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Call a no-argument getter that returns CharSequence and coerce it to String.
+     *
+     * Returns null when the method does not exist on this device's API level or when it
+     * throws — both are normal on an OEM tree, and neither may cost us the dump. Same
+     * reflection pattern this file already uses for AccessibilityNodeInfo methods that
+     * postdate the android-23 jar it compiles against.
+     */
+    private static String reflectString(Object target, String method) {
+        try {
+            Object value = target.getClass().getMethod(method).invoke(target);
+            if (value == null) return null;
+            return value.toString();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Collection
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static void collectInteractiveNodes(AccessibilityNodeInfo node, int depth,
+                                                Candidate ancestor,
+                                                List<NodeItem> list, int[] idCounter,
+                                                int winIndex) {
+        if (node == null) return;
+
+        CharSequence text = node.getText();
+        CharSequence desc = node.getContentDescription();
+        CharSequence cls = node.getClassName();
+        String viewId = node.getViewIdResourceName();
+
+        boolean clickable = node.isClickable();
+        boolean editable = node.isEditable();
+        boolean checkable = node.isCheckable();
+        boolean checked = node.isChecked();
+        boolean scrollable = node.isScrollable();
+
+        // Fields the tree carries but this tool used to never read. Each of the three is
+        // the ONLY semantics an element has when its text and content-desc are empty:
+        //   hintText     an empty search box is anonymous without it
+        //   tooltipText  an icon-only button explains itself here
+        //   isSelected   which tab of a tab bar is the current one
+        // Read through reflection for the same reason the whole file is: this is compiled
+        // against android-23, where getHintText() (API 26) and getTooltipText() (API 24)
+        // do not exist yet, while the device runs Android 15/16. `isSelected` is old
+        // enough to call directly, but one style for all three is easier to verify.
+        String hintStr = reflectString(node, "getHintText");
+        String tooltipStr = reflectString(node, "getTooltipText");
+        boolean selected = false;
+        try { selected = node.isSelected(); } catch (Throwable ignored) {}
+
+        boolean hasTextOrDesc = (text != null && text.length() > 0)
+                || (desc != null && desc.length() > 0)
+                || nonEmpty(hintStr)
+                || nonEmpty(tooltipStr);
+
+        Rect bounds = new Rect();
+        node.getBoundsInScreen(bounds);
+        // Guard against degenerate geometry: OEM trees contain rows where an off-screen
+        // child is reported with bottom < top, which would yield a nonsense center.
+        boolean sane = bounds.width() > 0 && bounds.height() > 0
+                && bounds.right > bounds.left && bounds.bottom > bounds.top;
+
+        NodeItem item = null;
+        if (sane) {
+            item = new NodeItem();
+            item.id = idCounter[0]++;
+            item.rawNode = node;
+            item.depth = depth;
+            item.type = cls != null ? simplifyType(cls.toString()) : "View";
+            item.text = text != null ? text.toString() : null;
+            item.desc = desc != null ? desc.toString() : null;
+            item.hint = hintStr;
+            item.tooltip = tooltipStr;
+            item.viewId = viewId;
+            item.left = bounds.left; item.top = bounds.top;
+            item.right = bounds.right; item.bottom = bounds.bottom;
+            item.centerX = bounds.centerX();
+            item.centerY = bounds.centerY();
+
+            item.clickable = clickable;
+            item.editableFlag = editable;
+            item.checkable = checkable;
+            item.checked = checked;
+            item.selected = selected;
+            item.scrollable = scrollable;
+            item.windowIndex = winIndex;
+            try { item.enabled = node.isEnabled(); } catch (Throwable ignored) { item.enabled = true; }
+            try { item.focusable = node.isFocusable(); } catch (Throwable ignored) {}
+            try { item.focused = node.isFocused(); } catch (Throwable ignored) {}
+            try { item.visibleToUser = node.isVisibleToUser(); } catch (Throwable ignored) { item.visibleToUser = true; }
+
+            // Resolve the tap target. Keep textless clickable containers: they are
+            // exactly the rows the model needs to tap, and dropping them was the reason
+            // "the row is clickable but nothing says so" kept biting.
+            if (clickable) {
+                item.targetId = item.id;
+                item.targetCenterX = item.centerX;
+                item.targetCenterY = item.centerY;
+                item.targetRatio = 1;
+            } else if (ancestor != null) {
+                int selfArea = Math.max(1, (item.right - item.left) * (item.bottom - item.top));
+                int ratio = Math.max(1, Math.round((float) ancestor.area / selfArea));
+                if (ratio <= MAX_ANCESTOR_RATIO) {
+                    item.targetId = ancestor.id;
+                    item.targetCenterX = ancestor.centerX;
+                    item.targetCenterY = ancestor.centerY;
+                    item.targetRatio = ratio;
+                }
+            }
+
+            boolean kept = hasTextOrDesc || clickable || editable || checkable || scrollable;
+            if (kept) list.add(item);
+        }
+
+        Candidate childAncestor = ancestor;
+        if (item != null && clickable) {
+            childAncestor = Candidate.of(item);
+        }
+
+        int childCount = node.getChildCount();
+        for (int i = 0; i < childCount; i++) {
+            AccessibilityNodeInfo child = null;
+            try { child = node.getChild(i); } catch (Throwable ignored) {}
+            if (child != null) {
+                collectInteractiveNodes(child, depth + 1, childAncestor, list, idCounter, winIndex);
+            }
+        }
+    }
+
+    /** Depth cap for node search. WeChat's real tree runs 14+ deep. */
+    private static final int MAX_NODE_DEPTH = 30;
+
+
+
+    /**
+     * Deterministic single-path type pipeline (Plan A: minimal method):
+     * 1. Resolve the target EXACTLY: the focused editable node (click first when
+     *    nothing is focused), an exact resource-id match (full "pkg:id/name" or the
+     *    short name after "/"), an "id:<res>" prefix, or "idx:N" (Nth editable node).
+     *    No numeric dump ids, no label/contains guessing — a wrong guess here used to
+     *    become a wrong tap somewhere else on screen (page closed / page navigated).
+     * 2. ACTION_SET_TEXT exactly once, then read the node back and classify:
+     *      ok, no error              -> verified (read-back equals input)
+     *      ok, verify_unavailable    -> written but not comparable (masked / unreadable /
+     *                                    stale node) — NOT a failure
+     *      !ok, no_focused_input     -> nothing editable is focused; includes focus_hint
+     *      !ok, target_not_found / ambiguous_target / target_not_editable
+     *      !ok, inject_rejected      -> ACTION_SET_TEXT returned false
+     *      !ok, verify_mismatch      -> read-back differs; before/after evidence attached
+     * 3. NO FALLBACKS: no tap, no clipboard, no side-effect retry. A failure is
+     *    reported with evidence instead of being papered over by the next strategy.
+     * 4. If submit is true AND the write succeeded, dispatch KEYCODE_ENTER.
+     * 5. Return structured JSON with the classification and before/after evidence.
+     */
+    private static void setValueWithUi(Object uiAutomation, Class<?> uiClass, int targetDisplayId, String targetSpec, String text) {
+        String err = null;
+        String mode = "none";
+        String error = null;
+        String reason = null;
+        String focusHint = null;
+        String boundsStr = null;
+        String beforeTxt = null;
+        String afterTxt = null;
+        String vid = null;
+        String cls = null;
+        boolean ok = false;
+        long start = System.currentTimeMillis();
+
+        try {
+            boolean focusMode = targetSpec == null || targetSpec.isEmpty() || "focused".equalsIgnoreCase(targetSpec);
+            int targetId = -1;
+            if (!focusMode) {
+                String cleanSpec = targetSpec.startsWith("node:") ? targetSpec.substring(5).trim() : targetSpec.trim();
+                try {
+                    targetId = Integer.parseInt(cleanSpec);
+                } catch (NumberFormatException nfe) {
+                    error = "invalid_target";
+                    reason = "Invalid target '" + targetSpec + "'. Target must be a numeric node ID from dump tree (e.g. '146') or omitted for focus mode.";
+                }
+            }
+
+            if (error == null) {
+                List<AccessibilityNodeInfo> all = new ArrayList<AccessibilityNodeInfo>();
+                List<NodeItem> nodeList = new ArrayList<NodeItem>();
+                boolean dropSystemUi = (targetDisplayId == 0);
+                java.util.Set<String> chromeTitles = dropSystemUi
+                        ? systemChromeTitles() : java.util.Collections.<String>emptySet();
+
+                for (int scanPass = 0; scanPass < 3; scanPass++) {
+                    all.clear();
+                    nodeList.clear();
+                    List<?> wins = windowsForDisplay(uiAutomation, uiClass, targetDisplayId);
+                    if (wins != null) {
+                        int winIndex = 0;
+                        int[] idCounter = new int[] { 1 };
+                        for (Object win : wins) {
+                            Object rootObj;
+                            try {
+                                rootObj = win.getClass().getMethod("getRoot").invoke(win);
+                            } catch (Throwable t) {
+                                rootObj = null;
+                            }
+                            AccessibilityNodeInfo rootNode = (rootObj instanceof AccessibilityNodeInfo)
+                                    ? (AccessibilityNodeInfo) rootObj : null;
+                            if (dropSystemUi && isSystemUiWindow(win, chromeTitles, rootNode)) {
+                                continue;
+                            }
+                            if (rootNode != null) {
+                                collectAll(rootNode, 0, all);
+                                collectInteractiveNodes(rootNode, 0, null, nodeList, idCounter, winIndex);
+                            }
+                            winIndex++;
+                        }
+                    }
+                    if (!all.isEmpty()) break;
+                    Thread.sleep(300);
+                }
+
+                AccessibilityNodeInfo targetNode = null;
+                if (focusMode) {
+                    AccessibilityNodeInfo focusedAny = null;
+                    for (AccessibilityNodeInfo an : all) {
+                        if (an.isFocused() && an.isEditable()) { targetNode = an; break; }
+                        if (focusedAny == null && an.isFocused()) focusedAny = an;
+                    }
+                    if (targetNode == null && focusedAny != null) {
+                        targetNode = findFirstEditable(focusedAny);
+                    }
+                    if (targetNode == null) {
+                        error = "no_focused_input";
+                        if (focusedAny != null) {
+                            String fc = focusedAny.getClassName() != null
+                                    ? simplifyType(focusedAny.getClassName().toString()) : "View";
+                            focusHint = fc + "@" + rectStr(focusedAny);
+                        }
+                        reason = "No input field is currently focused.";
+                    }
+                } else {
+                    NodeItem matchedItem = null;
+                    for (NodeItem item : nodeList) {
+                        if (item.id == targetId) {
+                            matchedItem = item;
+                            break;
+                        }
+                    }
+                    if (matchedItem == null) {
+                        error = "target_not_found";
+                        reason = "Node " + targetId + " not found on screen.";
+                    } else {
+                        AccessibilityNodeInfo raw = matchedItem.rawNode;
+                        if (raw != null) {
+                            targetNode = raw.isEditable() ? raw : findFirstEditable(raw);
+                        }
+                        if (targetNode == null) {
+                            error = "target_not_editable";
+                            reason = "Node " + targetId + " (" + matchedItem.type + ") is not an editable field.";
+                            if (matchedItem.text != null) beforeTxt = matchedItem.text;
+                        }
+                    }
+                }
+
+                if (targetNode != null && error == null) {
+                    vid = targetNode.getViewIdResourceName();
+                    cls = targetNode.getClassName() != null ? targetNode.getClassName().toString() : null;
+                    boundsStr = rectStr(targetNode);
+                    beforeTxt = targetNode.getText() != null ? targetNode.getText().toString() : null;
+
+                    try { targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS); } catch (Throwable ignored) {}
+
+                    android.os.Bundle args = new android.os.Bundle();
+                    args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
+                    boolean setOk = false;
+                    try {
+                        setOk = targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
+                    } catch (Throwable ignored) {}
+
+                    if (!setOk) {
+                        error = "inject_rejected";
+                    } else {
+                        mode = "action_set_text";
+                        Thread.sleep(60);
+                        boolean fresh = true;
+                        try { fresh = targetNode.refresh(); } catch (Throwable t) { fresh = false; }
+                        afterTxt = targetNode.getText() != null ? targetNode.getText().toString() : null;
+                        if (!fresh) {
+                            ok = true; error = "verify_unavailable"; reason = "stale_node";
+                        } else if (afterTxt == null) {
+                            ok = true; error = "verify_unavailable"; reason = "unreadable";
+                        } else if (afterTxt.equals(text)) {
+                            ok = true;
+                        } else if (isMasked(afterTxt, text)) {
+                            ok = true; error = "verify_unavailable"; reason = "masked";
+                        } else {
+                            error = "verify_mismatch";
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            err = String.valueOf(t);
+            error = "internal_error";
+        }
+
+        long costMs = System.currentTimeMillis() - start;
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"ok\":").append(ok);
+        sb.append(",\"display\":").append(targetDisplayId);
+        sb.append(",\"mode\":\"").append(mode).append("\"");
+        sb.append(",\"cost_ms\":").append(costMs);
+        if (targetSpec != null) sb.append(",\"target\":\"").append(escapeJson(targetSpec)).append("\"");
+        if (vid != null) sb.append(",\"vid\":\"").append(escapeJson(vid)).append("\"");
+        if (cls != null) sb.append(",\"type\":\"").append(escapeJson(cls)).append("\"");
+        if (boundsStr != null) sb.append(",\"bounds\":\"").append(escapeJson(boundsStr)).append("\"");
+        if (error != null) sb.append(",\"error\":\"").append(error).append("\"");
+        if (reason != null) sb.append(",\"reason\":\"").append(escapeJson(reason)).append("\"");
+        if (focusHint != null) sb.append(",\"focus_hint\":\"").append(escapeJson(focusHint)).append("\"");
+        if (beforeTxt != null) sb.append(",\"before_text\":\"").append(escapeJson(beforeTxt)).append("\"");
+        if (afterTxt != null) sb.append(",\"verified_text\":\"").append(escapeJson(afterTxt)).append("\"");
+        if (err != null) sb.append(",\"exception\":\"").append(escapeJson(err)).append("\"");
+        sb.append("}");
+        System.out.print(sb.toString());
+        System.out.flush();
+    }
+
+    private static AccessibilityNodeInfo findFirstEditable(AccessibilityNodeInfo root) {
+        if (root == null) return null;
+        if (root.isEditable()) return root;
+        int count = root.getChildCount();
+        for (int i = 0; i < count; i++) {
+            AccessibilityNodeInfo child = root.getChild(i);
+            if (child != null) {
+                if (child.isEditable()) return child;
+                AccessibilityNodeInfo sub = findFirstEditable(child);
+                if (sub != null) return sub;
+            }
+        }
+        return null;
+    }
+
+    /** "x1,y1,x2,y2" for the node — echoed in the result so WHERE the text went is auditable. */
+    private static String rectStr(AccessibilityNodeInfo n) {
+        Rect r = new Rect();
+        try { n.getBoundsInScreen(r); } catch (Throwable ignored) {}
+        return r.left + "," + r.top + "," + r.right + "," + r.bottom;
+    }
+
+    /**
+     * Read-back consisting only of mask glyphs cannot be compared with the sent text:
+     * password fields (native or in-WebView) report bullets instead of content. Such a
+     * write succeeded — it must be classified "verification unavailable", never failure.
+     */
+    private static boolean isMasked(String after, String sent) {
+        final String mask = "•●○∗*";
+        boolean sentVisible = false;
+        for (int i = 0; i < sent.length(); i++) {
+            char c = sent.charAt(i);
+            if (!Character.isWhitespace(c) && mask.indexOf(c) < 0) { sentVisible = true; break; }
+        }
+        if (!sentVisible) return false;
+        boolean sawMask = false;
+        for (int i = 0; i < after.length(); i++) {
+            char c = after.charAt(i);
+            if (Character.isWhitespace(c)) continue;
+            if (mask.indexOf(c) < 0) return false;
+            sawMask = true;
+        }
+        return sawMask;
+    }
+
+    private static void collectAll(AccessibilityNodeInfo node, int depth,
+                                   List<AccessibilityNodeInfo> out) {
+        if (node == null || depth > MAX_NODE_DEPTH) return;
+        out.add(node);
+        int c = node.getChildCount();
+        for (int i = 0; i < c; i++) {
+            AccessibilityNodeInfo ch = null;
+            try { ch = node.getChild(i); } catch (Throwable ignored) {}
+            if (ch != null) collectAll(ch, depth + 1, out);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static String simplifyType(String className) {
+        int idx = className.lastIndexOf('.');
+        if (idx >= 0 && idx < className.length() - 1) {
+            return className.substring(idx + 1);
+        }
+        return className;
+    }
+
+    private static String escapeJson(String s) {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"': sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\b': sb.append("\\b"); break;
+                case '\f': sb.append("\\f"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default:
+                    if (c < ' ') {
+                        String hex = Integer.toHexString(c);
+                        sb.append("\\u0000".substring(0, 6 - hex.length())).append(hex);
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        return sb.toString();
+    }
+}

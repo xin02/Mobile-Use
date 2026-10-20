@@ -1,0 +1,340 @@
+package com.agent.mobileuse;
+
+import android.app.Notification;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.drawable.Icon;
+import android.media.AudioAttributes;
+import android.media.RingtoneManager;
+import android.net.Uri;
+import android.os.Build;
+import android.text.Html;
+import android.util.Log;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
+
+public class NotifyReceiver extends BroadcastReceiver {
+    private static final String TAG = "AgentNotifyReceiver";
+    public static final String ACTION_NOTIFY = "com.agent.mobileuse.ACTION_NOTIFY";
+    public static final String ACTION_CLEAR = "com.agent.mobileuse.ACTION_CLEAR";
+    public static final String ACTION_HANDOFF = "com.agent.mobileuse.ACTION_HANDOFF";
+
+    public static final String CHANNEL_ID = "dsh_agent_completed";
+    public static final String CHANNEL_ID_SILENT = "dsh_agent_completed_silent";
+    public static final String CHANNEL_NAME = "DeepSeek Agent 任务完成";
+    public static final String DEFAULT_TAG = "dsh_agent";
+    public static final int DEFAULT_ID = 2020;
+
+    @Override
+    public void onReceive(Context context, Intent intent) {
+        if (intent == null) return;
+        String action = intent.getAction();
+        Log.i(TAG, "onReceive action: " + action);
+
+        NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null) {
+            Log.e(TAG, "NotificationManager is null");
+            return;
+        }
+
+        String tag = intent.getStringExtra("tag");
+        if (tag == null || tag.isEmpty()) {
+            tag = DEFAULT_TAG;
+        }
+        int id = intent.getIntExtra("id", DEFAULT_ID);
+
+        if (ACTION_CLEAR.equals(action)) {
+            Log.i(TAG, "Canceling notification: tag=" + tag + ", id=" + id);
+            nm.cancel(tag, id);
+            return;
+        }
+
+        if (ACTION_HANDOFF.equals(action)) {
+            Log.i(TAG, "ACTION_HANDOFF received from Fluid Cloud click! Triggering handoff to background...");
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        java.net.URL url = new java.net.URL("http://127.0.0.1:3070/api/mode?mode=background");
+                        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+                        conn.setRequestMethod("GET");
+                        conn.setConnectTimeout(1500);
+                        conn.setReadTimeout(1500);
+                        int code = conn.getResponseCode();
+                        Log.i(TAG, "Mode switch (background) finished, response code: " + code);
+                        conn.disconnect();
+                    } catch (Throwable t) {
+                        Log.w(TAG, "HTTP mode switch error, trying curl fallback: " + t.getMessage());
+                        try {
+                            Runtime.getRuntime().exec(new String[]{"/system/bin/sh", "-c", "curl -s 'http://127.0.0.1:3070/api/mode?mode=background'"}).waitFor();
+                        } catch (Throwable ignored) {}
+                    }
+                }
+            }).start();
+            return;
+        }
+
+        if (ACTION_NOTIFY.equals(action)) {
+            String title = intent.getStringExtra("title");
+            String sessionTitle = intent.getStringExtra("session_title");
+            if (sessionTitle == null || sessionTitle.isEmpty()) {
+                sessionTitle = intent.getStringExtra("subtext");
+            }
+            String content = intent.getStringExtra("content");
+            String sessionId = intent.getStringExtra("session_id");
+            if (sessionId == null || sessionId.isEmpty()) {
+                sessionId = intent.getStringExtra("session");
+            }
+            int total = intent.getIntExtra("total", 0);
+            int completed = intent.getIntExtra("completed", 0);
+            boolean isCompleted = intent.getBooleanExtra("is_completed", false) || (total > 0 && completed >= total);
+
+            Log.i(TAG, "Received notification signal: title=" + title + " sessionTitle=" + sessionTitle + " (" + completed + "/" + total + ") isCompleted=" + isCompleted + " sessionId=" + sessionId);
+
+            // Cancel any previous notification to keep notification drawer clean
+            nm.cancel(tag, id);
+
+            // Trigger high-priority heads-up notification when task completion signal is given
+            if (isCompleted) {
+                postCompletedNotification(context, nm, tag, id, title, sessionTitle, content, sessionId);
+            }
+        }
+    }
+
+    /**
+     * Clean all emojis, symbols, and formatting artifacts for a crisp, professional text presentation.
+     */
+    private static String cleanEmoji(String text) {
+        if (text == null) return "";
+        // Replace unicode todo indicators with clean text prefixes
+        text = text.replace("☑", "[已完成] ")
+                   .replace("◉", "[进行中] ")
+                   .replace("☐", "[待办] ")
+                   .replace("🎉", "")
+                   .replace(">>", "");
+        // Remove unicode emoji ranges and miscellaneous symbols
+        text = text.replaceAll("[\\p{So}\\p{Cn}]", "");
+        text = text.replaceAll("[\\uD83C-\\uDBFF\\uDC00-\\uDFFF]", "");
+        text = text.replaceAll("[\\u2600-\\u27BF]", "");
+        text = text.replaceAll("[\\uE000-\\uF8FF]", "");
+        return text.trim();
+    }
+
+    private static CharSequence parseCleanHtml(String text) {
+        if (text == null) return "";
+        String cleaned = cleanEmoji(text);
+        if (!cleaned.contains("<") && !cleaned.contains("&")) {
+            return cleaned;
+        }
+        try {
+            String formatted = cleaned.replace("\n", "<br>");
+            return Html.fromHtml(formatted);
+        } catch (Throwable t) {
+            return cleaned;
+        }
+    }
+
+    public static void ensureChannel(NotificationManager nm) {
+        ensureChannel(nm, false);
+    }
+
+    public static void ensureChannel(NotificationManager nm, boolean silent) {
+        if (Build.VERSION.SDK_INT >= 26) {
+            String chId = silent ? CHANNEL_ID_SILENT : CHANNEL_ID;
+            String chName = silent ? (CHANNEL_NAME + " (静音)") : CHANNEL_NAME;
+            try {
+                Class<?> channelClass = Class.forName("android.app.NotificationChannel");
+                Constructor<?> ctor = channelClass.getConstructor(String.class, CharSequence.class, int.class);
+                // silent: IMPORTANCE_DEFAULT = 3 (Displays banner/fluid cloud without audio/vibration)
+                // non-silent: IMPORTANCE_HIGH = 4 (Heads-up banner notification with sound and vibration)
+                Object channel = ctor.newInstance(chId, chName, silent ? 3 : 4);
+
+                Method setDesc = channelClass.getMethod("setDescription", String.class);
+                setDesc.invoke(channel, "DeepSeek Harness Agent 任务全部完成提醒");
+
+                Method enableLights = channelClass.getMethod("enableLights", boolean.class);
+                enableLights.invoke(channel, !silent);
+
+                Method enableVibration = channelClass.getMethod("enableVibration", boolean.class);
+                enableVibration.invoke(channel, !silent);
+
+                if (!silent) {
+                    try {
+                        AudioAttributes audioAttributes = new AudioAttributes.Builder()
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                            .build();
+                        Uri soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+                        Method setSound = channelClass.getMethod("setSound", Uri.class, AudioAttributes.class);
+                        setSound.invoke(channel, soundUri, audioAttributes);
+                    } catch (Throwable ignored) {}
+                } else {
+                    try {
+                        Method setSound = channelClass.getMethod("setSound", Uri.class, AudioAttributes.class);
+                        setSound.invoke(channel, null, null);
+                    } catch (Throwable ignored) {}
+                }
+
+                Method createMethod = nm.getClass().getMethod("createNotificationChannel", channelClass);
+                createMethod.invoke(nm, channel);
+                Log.d(TAG, "NotificationChannel created/ensured: " + chId);
+            } catch (Throwable t) {
+                Log.w(TAG, "ensureChannel reflection warning: " + t.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Create crisp vector-drawn Checkmark in vivid cyber green (#00FF9D) with 100% transparent background.
+     */
+    public static Bitmap createCyberCheckmarkBitmap(int size) {
+        Bitmap bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas canvas = new android.graphics.Canvas(bitmap);
+
+        android.graphics.Paint checkPaint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        checkPaint.setColor(0xFF00FF9D); // Vivid Cyber Green / Mint (matches terminal icon)
+        checkPaint.setStyle(android.graphics.Paint.Style.STROKE);
+        checkPaint.setStrokeWidth(size * 0.13f);
+        checkPaint.setStrokeCap(android.graphics.Paint.Cap.ROUND);
+        checkPaint.setStrokeJoin(android.graphics.Paint.Join.ROUND);
+
+        android.graphics.Path path = new android.graphics.Path();
+        float p1X = size * 0.20f;
+        float p1Y = size * 0.52f;
+        float p2X = size * 0.42f;
+        float p2Y = size * 0.74f;
+        float p3X = size * 0.80f;
+        float p3Y = size * 0.26f;
+
+        path.moveTo(p1X, p1Y);
+        path.lineTo(p2X, p2Y);
+        path.lineTo(p3X, p3Y);
+
+        canvas.drawPath(path, checkPaint);
+        return bitmap;
+    }
+
+    public static void postCompletedNotification(Context context, NotificationManager nm, String tag, int id,
+                                                 String title, String sessionTitle, String content,
+                                                 String sessionId) {
+        try {
+            // Personalization settings
+            android.content.SharedPreferences sp = context.getSharedPreferences("agent_capsule_state", Context.MODE_PRIVATE);
+            boolean enableFluidCloud = sp.getBoolean("enable_fluid_cloud", true);
+            boolean enableAlert = sp.getBoolean("enable_completion_alert", true);
+
+            ensureChannel(nm, !enableAlert);
+
+            // Record completed session ID so running state of same session can auto-dismiss it
+            if (sessionId != null && !sessionId.isEmpty()) {
+                try {
+                    context.getSharedPreferences("agent_capsule_state", Context.MODE_PRIVATE)
+                           .edit().putString("last_completed_sid", sessionId).apply();
+                } catch (Throwable ignored) {}
+            }
+
+            Notification.Builder builder = new Notification.Builder(context);
+            if (Build.VERSION.SDK_INT >= 26) {
+                try {
+                    Method setChannelMethod = builder.getClass().getMethod("setChannelId", String.class);
+                    setChannelMethod.invoke(builder, enableAlert ? CHANNEL_ID : CHANNEL_ID_SILENT);
+                } catch (Throwable t) {
+                    Log.w(TAG, "setChannelId reflection warning: " + t.getMessage());
+                }
+            }
+
+            // Crisp pure title without emoji or count numbers
+            String cleanTitle = cleanEmoji(title);
+            if (cleanTitle.isEmpty()) {
+                cleanTitle = "已完成";
+            }
+            builder.setContentTitle(cleanTitle);
+
+            // Clean full content text for BigTextStyle
+            String cleanContent = cleanEmoji(content);
+            if (cleanContent.isEmpty()) {
+                cleanContent = "所有执行事项均已处理完毕";
+            }
+
+            // Card Header: Use genuine session title if provided
+            String cleanSubtext = cleanEmoji(sessionTitle);
+            String cardHeaderTitle = !cleanSubtext.isEmpty() ? cleanSubtext : "任务已全部完成";
+
+            // BigTextStyle for rich clean view without emoji
+            Notification.BigTextStyle bigStyle = new Notification.BigTextStyle();
+            bigStyle.setBigContentTitle(cardHeaderTitle);
+            bigStyle.bigText(parseCleanHtml(cleanContent));
+            builder.setStyle(bigStyle);
+
+            // Set SmallIcon and LargeIcon to transparent vector Cyber Checkmark
+            try {
+                Bitmap checkIcon = createCyberCheckmarkBitmap(192);
+                if (checkIcon != null && Build.VERSION.SDK_INT >= 23) {
+                    Icon icon = Icon.createWithBitmap(checkIcon);
+                    builder.setSmallIcon(icon);
+                    builder.setLargeIcon(checkIcon);
+                    android.os.Bundle extras = new android.os.Bundle();
+                    extras.putBoolean("enable_fluid_cloud", enableFluidCloud);
+                    if (enableFluidCloud) {
+                        extras.putParcelable("oplus_small_icon", icon);
+                    }
+                    builder.addExtras(extras);
+                } else {
+                    builder.setSmallIcon(R.drawable.dsh_whale_icon);
+                }
+            } catch (Throwable t) {
+                builder.setSmallIcon(R.drawable.dsh_whale_icon);
+            }
+
+            if (enableAlert) {
+                builder.setDefaults(Notification.DEFAULT_ALL);
+            } else {
+                builder.setDefaults(0);
+                builder.setSound(null);
+                builder.setVibrate(null);
+                try {
+                    Method setSilent = builder.getClass().getMethod("setNotificationSilent");
+                    setSilent.invoke(builder);
+                } catch (Throwable ignored) {}
+            }
+
+            // Click Jump PendingIntent -> Launch DemoDialogActivity (Action Button Overlay / 灵动坞)
+            Intent overlayIntent = new Intent(context, DemoDialogActivity.class);
+            // NO_ANIMATION is a best-effort hint; ColorOS still runs its capsule-expand remote
+            // transition on notification taps and the flag does not reach WindowManager. The
+            // real fix is skip_glow below, which stops the full-screen rim from being scaled
+            // up out of the notification.
+            overlayIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+            // Tapped from a notification: ColorOS animates the window open from the capsule,
+            // so suppress the entrance glow for this launch.
+            overlayIntent.putExtra("skip_glow", true);
+            if (sessionId != null && !sessionId.isEmpty()) {
+                overlayIntent.putExtra("session_id", sessionId);
+            }
+            int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+            if (Build.VERSION.SDK_INT >= 23) {
+                flags |= 0x04000000; // FLAG_IMMUTABLE
+            }
+            int requestCode = (sessionId != null && !sessionId.isEmpty()) ? sessionId.hashCode() : id;
+            PendingIntent pi = PendingIntent.getActivity(context, requestCode, overlayIntent, flags);
+            builder.setContentIntent(pi);
+            builder.setAutoCancel(true); // Dismiss notification when clicked
+
+            builder.setPriority(2); // Notification.PRIORITY_MAX = 2
+            builder.setShowWhen(true);
+            builder.setOngoing(false);
+
+            Notification notification = builder.build();
+            nm.notify(tag, id, notification);
+            Log.i(TAG, "Task completed heads-up notification posted: tag=" + tag + ", id=" + id);
+        } catch (Throwable t) {
+            Log.e(TAG, "postCompletedNotification failed: " + t.getMessage(), t);
+        }
+    }
+}

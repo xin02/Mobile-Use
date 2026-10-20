@@ -1,0 +1,6 @@
+id=agent_mobile_use_mi9
+name=Agent Mobile Use (Xiaomi 9 / Android 9)
+version=v0.1.0-mi9
+versionCode=1
+author=adapted from AcidGr/agent-mobile-use
+description=Android 9 (API 28) 适配版：前台模式手机自动化网关（3070）。原项目需要 Android 15/16 + 副屏，本版改用 uiautomator dump + input 原语，全部能力在主屏可用。

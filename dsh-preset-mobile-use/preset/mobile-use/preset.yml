@@ -1,0 +1,3 @@
+name: Mobile Use 模式
+description: 供 DeepSeek Harness 使用的 Mobile Use 工具，让 Agent 能够操作 Android 手机上的应用。
+order: 2

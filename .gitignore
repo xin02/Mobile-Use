@@ -1,0 +1,13 @@
+# Build artifacts (rebuildable from source)
+vd-server-mi9/vd_server_mi9
+agent-mobile-use/vd-tool-java/bin/out_*/
+agent-mobile-use/vd-tool-java/bin/*.jar
+agent-mobile-use/vd-tool-java/bin/classes/
+*.log
+
+# Local env / secrets
+*.env
+
+# OS noise
+Thumbs.db
+.DS_Store

@@ -1,0 +1,8 @@
+# OS / Build Artifacts
+.DS_Store
+*.swp
+*~
+# Match build output at any depth: the bare `bin/classes/` pattern only matched a
+# top-level directory, so vd-tool-java/bin/classes/*.class stayed tracked.
+**/bin/classes/
+**/probe-java/classes/
